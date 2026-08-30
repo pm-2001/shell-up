@@ -7,7 +7,18 @@ sane zsh defaults, installed by one command and fully reversible by another.
 npx @pm-2001/shellup init
 ```
 
-The package is scoped, but the command it installs is just `shellup`.
+Or install it so `shellup` stays on your `PATH`:
+
+```bash
+npm i -g @pm-2001/shellup     # the -g matters
+shellup init
+```
+
+The package name is scoped; the command is just `shellup`.
+
+> **`zsh: command not found: shellup`?** You installed without `-g`. A plain
+> `npm i @pm-2001/shellup` only writes `./node_modules/.bin/shellup`, which is not on
+> your `PATH`. Use `npm i -g`, or run it through `npx` as above.
 
 No framework to adopt, no dotfiles repo to fork, and **three lines** added to your
 `.zshrc`. Everything else lives in `~/.config/shellup`.
