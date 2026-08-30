@@ -1,0 +1,27 @@
+{
+  "name": "shellup",
+  "version": "0.1.0",
+  "description": "Level up your terminal in 60 seconds — a beautiful prompt, modern tool swaps, and sane defaults, installed by one command and reversible by another.",
+  "keywords": ["terminal", "zsh", "prompt", "cli", "dotfiles", "shell", "developer-experience", "theme", "productivity"],
+  "license": "MIT",
+  "author": "pm-2001",
+  "type": "module",
+  "bin": { "shellup": "dist/cli.js" },
+  "files": ["dist", "runtime", "README.md", "LICENSE"],
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsup --watch",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "npm run build"
+  },
+  "dependencies": {
+    "@clack/prompts": "^1.7.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "tsup": "^8.5.1",
+    "typescript": "^7.0.2"
+  }
+}
