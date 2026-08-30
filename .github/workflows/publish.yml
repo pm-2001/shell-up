@@ -1,0 +1,35 @@
+name: Publish to npm
+
+# Publish straight from the browser: create a GitHub Release (Releases → Draft a
+# new release → choose a tag like v0.1.0 → Publish). This workflow then builds
+# and runs `npm publish`.
+#
+# One-time setup: create an npm access token (npmjs.com → Access Tokens →
+# Generate → Automation), then add it to this repo as a secret named NPM_TOKEN
+# (GitHub → Settings → Secrets and variables → Actions → New repository secret).
+on:
+  release:
+    types: [published]
+  # Also runnable by hand from the Actions tab.
+  workflow_dispatch:
+
+jobs:
+  publish:
+    # Pure TypeScript build, so no need for a macOS runner here.
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # Lets npm attach a signed provenance attestation to the published package,
+      # which shows up as a "Built and signed on GitHub Actions" badge on npm.
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          registry-url: https://registry.npmjs.org
+      - run: npm ci
+      # `npm publish` runs prepublishOnly (typecheck + build) before uploading.
+      - run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

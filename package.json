@@ -2,18 +2,45 @@
   "name": "shellup",
   "version": "0.1.0",
   "description": "Level up your terminal in 60 seconds — a beautiful prompt, modern tool swaps, and sane defaults, installed by one command and reversible by another.",
-  "keywords": ["terminal", "zsh", "prompt", "cli", "dotfiles", "shell", "developer-experience", "theme", "productivity"],
+  "keywords": [
+    "terminal",
+    "zsh",
+    "prompt",
+    "cli",
+    "dotfiles",
+    "shell",
+    "developer-experience",
+    "theme",
+    "productivity"
+  ],
+  "homepage": "https://github.com/pm-2001/shell-up#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/pm-2001/shell-up.git"
+  },
+  "bugs": {
+    "url": "https://github.com/pm-2001/shell-up/issues"
+  },
   "license": "MIT",
   "author": "pm-2001",
   "type": "module",
-  "bin": { "shellup": "dist/cli.js" },
-  "files": ["dist", "runtime", "README.md", "LICENSE"],
-  "engines": { "node": ">=18" },
+  "bin": {
+    "shellup": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "runtime",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
   "scripts": {
     "build": "tsup",
     "dev": "tsup --watch",
     "typecheck": "tsc --noEmit",
-    "prepublishOnly": "npm run build"
+    "prepublishOnly": "npm run typecheck && npm run build"
   },
   "dependencies": {
     "@clack/prompts": "^1.7.0",
