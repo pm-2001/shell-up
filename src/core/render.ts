@@ -21,14 +21,28 @@ function renderTools(config: Config): string {
   const parts: string[] = [HEADER(version())];
   for (const id of config.tools) {
     const tool = toolById(id);
-    if (!tool?.snippet) continue;
-    // Guarded so an uninstalled or later-removed tool is a no-op, never a broken shell.
-    parts.push(
-      `\n# ── ${tool.label} ${"─".repeat(Math.max(0, 68 - tool.label.length))}\n` +
-        `if command -v ${tool.bin} >/dev/null 2>&1; then\n` +
-        tool.snippet.split("\n").map((l) => (l.trim() ? `  ${l}` : l)).join("\n") +
-        `\nfi\n`,
-    );
+    if (!tool || (!tool.snippet && !tool.sourceFiles)) continue;
+
+    const rule = `\n# \u2500\u2500 ${tool.label} ${"\u2500".repeat(Math.max(0, 68 - tool.label.length))}\n`;
+    const indent = (body: string) => body.split("\n").map((l) => (l.trim() ? `  ${l}` : l)).join("\n");
+
+    if (tool.sourceFiles) {
+      // A plugin: its settings must be set before the file loads, and the file
+      // itself lives at a different path on every package manager. The anonymous
+      // function keeps the loop variable out of the user's shell.
+      parts.push(
+        rule +
+          (tool.snippet ? tool.snippet + "\n" : "") +
+          `() {\n  local p\n  for p in \\\n` +
+          tool.sourceFiles.map((f) => `    "${f}"`).join(" \\\n") +
+          `\n  do\n    [[ -r $p ]] && { source $p; break }\n  done\n}\n`,
+      );
+      continue;
+    }
+
+    // A binary: guarded so an uninstalled or later-removed tool is a no-op,
+    // never a broken shell.
+    parts.push(rule + `if command -v ${tool.bin} >/dev/null 2>&1; then\n` + indent(tool.snippet!) + `\nfi\n`);
   }
   return parts.join("");
 }

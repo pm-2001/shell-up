@@ -26,6 +26,15 @@ export function has(bin: string): boolean {
   }
 }
 
+/**
+ * Zsh plugins ship as a sourceable file, not a binary, so `command -v` can't see
+ * them. Package managers disagree about where they land, hence a candidate list.
+ */
+export function hasFile(paths: string[]): boolean {
+  const prefix = process.env.HOMEBREW_PREFIX ?? "/opt/homebrew";
+  return paths.some((path) => existsSync(path.replace("${HOMEBREW_PREFIX:-/opt/homebrew}", prefix)));
+}
+
 function detectPackageManager(): PackageManager {
   for (const pm of ["brew", "apt", "dnf", "pacman"] as const) if (has(pm)) return pm;
   return "none";

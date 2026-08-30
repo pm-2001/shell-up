@@ -1,6 +1,6 @@
 import { execFileSync } from "node:child_process";
 import { has, type PackageManager } from "./detect.js";
-import { packageFor, type Tool } from "./tools.js";
+import { isPresent, packageFor, type Tool } from "./tools.js";
 
 export interface InstallResult {
   installed: string[];
@@ -29,7 +29,7 @@ export function installTools(tools: Tool[], pm: PackageManager): InstallResult {
 
   const wanted: Tool[] = [];
   for (const tool of tools) {
-    if (has(tool.bin)) { result.alreadyPresent.push(tool.id); continue; }
+    if (isPresent(tool)) { result.alreadyPresent.push(tool.id); continue; }
     if (!packageFor(tool, pm)) { result.unsupported.push(tool.id); continue; }
     wanted.push(tool);
   }
@@ -50,7 +50,7 @@ export function installTools(tools: Tool[], pm: PackageManager): InstallResult {
        so we judge each tool by whether its binary is now on PATH. */
   }
 
-  for (const tool of wanted) (has(tool.bin) ? result.installed : result.failed).push(tool.id);
+  for (const tool of wanted) (isPresent(tool) ? result.installed : result.failed).push(tool.id);
   return result;
 }
 

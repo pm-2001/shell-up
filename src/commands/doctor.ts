@@ -1,7 +1,7 @@
 import pc from "picocolors";
 import { detect, has } from "../core/detect.js";
 import { loadConfig } from "../core/config.js";
-import { TOOLS, toolById } from "../core/tools.js";
+import { TOOLS, toolById, isPresent } from "../core/tools.js";
 import { hasBlock } from "../core/shellrc.js";
 import { CONFIG_DIR, INIT_FILE, tilde } from "../core/paths.js";
 import { existsSync } from "node:fs";
@@ -49,7 +49,7 @@ export function doctor(): void {
   console.log(`\n${pc.bold("  Tools")}`);
   const selected = new Set(config?.tools ?? []);
   for (const tool of TOOLS) {
-    const present = has(tool.bin);
+    const present = isPresent(tool);
     if (!selected.has(tool.id) && !present) continue;
     const state = present ? "ok" : "warn";
     const detail = present
@@ -57,7 +57,7 @@ export function doctor(): void {
       : "selected but not installed — integration is dormant";
     console.log(line(state, tool.label, detail));
   }
-  const missing = [...selected].map((id) => toolById(id)).filter((t) => t && !has(t.bin));
+  const missing = [...selected].map((id) => toolById(id)).filter((t) => t && !isPresent(t!));
   if (missing.length) problems.push(`install missing tools: ${missing.map((t) => t!.label).join(", ")}`);
 
   console.log();

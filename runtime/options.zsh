@@ -6,7 +6,18 @@
 [[ -o interactive ]] || return 0
 
 # ── History ────────────────────────────────────────────────────────────────
-HISTFILE="${HISTFILE:-$HOME/.zsh_history}"
+# macOS ships per-session history in /etc/zshrc_Apple_Terminal, which runs BEFORE
+# this file. It normally stands down when SHARE_HISTORY is set — but on a restored
+# Terminal window it repoints HISTFILE into ~/.zsh_sessions straight away, before
+# it can see our options, silently defeating the shared history set up below.
+# SHELL_SESSION_HISTORY=0 is Apple's documented opt-out; the reclaim handles the
+# window that has already been hijacked.
+SHELL_SESSION_HISTORY=0
+if [[ $HISTFILE == */.zsh_sessions/* ]]; then
+  HISTFILE="${ZDOTDIR:-$HOME}/.zsh_history"
+  [[ -r $HISTFILE ]] && fc -R "$HISTFILE"
+fi
+HISTFILE="${HISTFILE:-${ZDOTDIR:-$HOME}/.zsh_history}"
 HISTSIZE=100000
 SAVEHIST=100000
 setopt append_history          # never truncate another shell's writes

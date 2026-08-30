@@ -26,6 +26,15 @@ background process, repainting when the result lands.
 > npm test                                                    4s
 ```
 
+**Suggestions as you type.** The rest of the command appears in grey, pulled from
+what you've actually run before — press <kbd>→</kbd> to accept it, <kbd>Alt</kbd>+<kbd>→</kbd>
+to take one word. When history has nothing, it falls back to the completion system, so
+`git ` still suggests a subcommand on a brand-new machine.
+
+```
+$ git pus­h origin main        ← "h origin main" is grey; → accepts
+```
+
 **Three themes**, two of which need no special font:
 
 | theme | needs a Nerd Font | |
@@ -38,7 +47,7 @@ background process, repainting when the result lands.
 [eza](https://github.com/eza-community/eza), [bat](https://github.com/sharkdp/bat),
 [fzf](https://github.com/junegunn/fzf), [zoxide](https://github.com/ajeetdsouza/zoxide),
 [fd](https://github.com/sharkdp/fd), [ripgrep](https://github.com/BurntSushi/ripgrep),
-[git-delta](https://github.com/dandavison/delta), lazygit, btop, jq, tldr.
+[git-delta](https://github.com/dandavison/delta), [zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions), lazygit, btop, jq, tldr.
 
 **zsh defaults worth having**: 100k lines of shared, deduplicated history; completion
 with case-insensitive matching and a menu; `auto_cd` and a directory stack; prefix-aware
@@ -83,6 +92,10 @@ leaves the file byte-for-byte as it was.
 - **`custom.zsh` is sourced last**, so anything you write there wins over shellup's
   defaults without forking anything.
 - **`compinit` checks its cache once a day** rather than rebuilding on every shell start.
+- **macOS per-session history is switched off.** `/etc/zshrc_Apple_Terminal` runs before
+  your `.zshrc` and, on a restored Terminal window, repoints `HISTFILE` into
+  `~/.zsh_sessions` — which quietly breaks a single shared history. shellup takes Apple's
+  documented opt-out and reclaims the file.
 
 ## Requirements
 

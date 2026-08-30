@@ -1,7 +1,14 @@
+import { has, hasFile } from "./detect.js";
+
 export interface Tool {
   id: string;
-  /** Binary name to probe with `command -v`. Often differs from the package name. */
-  bin: string;
+  /** Binary name to probe with `command -v`. Omitted for plugins, which have none. */
+  bin?: string;
+  /**
+   * For zsh plugins: candidate paths to the sourceable file. Presence means "any
+   * of these exists", and the generated config sources the first one it finds.
+   */
+  sourceFiles?: string[];
   label: string;
   hint: string;
   brew?: string;
@@ -92,9 +99,40 @@ export const TOOLS: Tool[] = [
     id: "tldr", bin: "tldr", label: "tldr", hint: "man pages with actual examples",
     brew: "tealdeer", apt: "tealdeer", dnf: "tealdeer", pacman: "tealdeer", recommended: false,
   },
+  // Last on purpose: it wraps ZLE widgets, so it has to load after anything that
+  // defines its own (fzf, zoxide).
+  {
+    id: "autosuggestions",
+    label: "autosuggestions",
+    hint: "greys in the rest of the command as you type — press → to accept",
+    brew: "zsh-autosuggestions", apt: "zsh-autosuggestions",
+    dnf: "zsh-autosuggestions", pacman: "zsh-autosuggestions",
+    recommended: true,
+    sourceFiles: [
+      "${HOMEBREW_PREFIX:-/opt/homebrew}/share/zsh-autosuggestions/zsh-autosuggestions.zsh",
+      "/usr/local/share/zsh-autosuggestions/zsh-autosuggestions.zsh",
+      "/usr/share/zsh-autosuggestions/zsh-autosuggestions.zsh",
+      "/usr/share/zsh/plugins/zsh-autosuggestions/zsh-autosuggestions.zsh",
+    ],
+    // Set before sourcing, because the plugin reads some of these at load time.
+    snippet: [
+      `# 'history' replays what you actually ran; 'completion' falls back to the`,
+      `# completion system, so \`git \` suggests a subcommand on a fresh machine.`,
+      `ZSH_AUTOSUGGEST_STRATEGY=(history completion)`,
+      `ZSH_AUTOSUGGEST_HIGHLIGHT_STYLE='fg=8'`,
+      `# Stops the plugin doing work on pasted blobs, where it can't help anyway.`,
+      `ZSH_AUTOSUGGEST_BUFFER_MAX_SIZE=20`,
+    ].join("\n"),
+  },
 ];
 
 export const toolById = (id: string): Tool | undefined => TOOLS.find((t) => t.id === id);
+
+/** Binaries are probed on PATH; plugins are probed on disk. */
+export function isPresent(tool: Tool): boolean {
+  if (tool.sourceFiles) return hasFile(tool.sourceFiles);
+  return tool.bin ? has(tool.bin) : false;
+}
 
 export function packageFor(tool: Tool, pm: string): string | undefined {
   return pm === "brew" ? tool.brew : pm === "apt" ? tool.apt : pm === "dnf" ? tool.dnf : pm === "pacman" ? tool.pacman : undefined;

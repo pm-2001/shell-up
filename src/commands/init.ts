@@ -2,7 +2,7 @@ import * as p from "@clack/prompts";
 import pc from "picocolors";
 import { detect, has } from "../core/detect.js";
 import { DEFAULT_CONFIG, loadConfig, saveConfig, type Config } from "../core/config.js";
-import { TOOLS, toolById } from "../core/tools.js";
+import { TOOLS, toolById, isPresent } from "../core/tools.js";
 import { installTools, applyGitConfig } from "../core/install.js";
 import { apply, version } from "../core/render.js";
 import { installBlock } from "../core/shellrc.js";
@@ -51,6 +51,15 @@ export async function init(opts: { yes?: boolean } = {}): Promise<void> {
 
   if (existing) {
     p.log.info(`Existing setup found (theme ${pc.cyan(existing.theme)}). This will reconfigure it.`);
+    // Your previous answers stay pre-selected, so anything shellup has added since
+    // then would sit unchecked and unnoticed. Call it out rather than opting you in.
+    const added = TOOLS.filter((t) => t.recommended && !existing.tools.includes(t.id));
+    if (added.length) {
+      p.log.info(
+        `New since your last run: ${added.map((t) => pc.cyan(t.label)).join(", ")}` +
+          `\n  Press ${pc.cyan("Space")} on the list below to add ${added.length > 1 ? "them" : "it"}.`,
+      );
+    }
   }
 
   // ── Theme ────────────────────────────────────────────────────────────────
@@ -85,7 +94,7 @@ export async function init(opts: { yes?: boolean } = {}): Promise<void> {
     initialValues: existing?.tools ?? TOOLS.filter((t) => t.recommended).map((t) => t.id),
     options: TOOLS.map((t) => ({
       value: t.id,
-      label: t.label + (has(t.bin) ? pc.green("  (installed)") : ""),
+      label: t.label + (isPresent(t) ? pc.green("  (installed)") : ""),
       hint: t.hint,
     })),
   })) as string[];
@@ -121,7 +130,7 @@ export async function init(opts: { yes?: boolean } = {}): Promise<void> {
   };
 
   // ── Install missing binaries ─────────────────────────────────────────────
-  const missing = selectedTools.map((id) => toolById(id)!).filter((t) => t && !has(t.bin));
+  const missing = selectedTools.map((id) => toolById(id)!).filter((t) => t && !isPresent(t));
   if (missing.length && env.packageManager !== "none") {
     const doInstall =
       opts.yes ||
@@ -153,7 +162,7 @@ export async function init(opts: { yes?: boolean } = {}): Promise<void> {
 
   // ── git-delta needs global git config, which is outside our directory ─────
   const delta = toolById("delta")!;
-  if (selectedTools.includes("delta") && has(delta.bin) && delta.gitConfig) {
+  if (selectedTools.includes("delta") && isPresent(delta) && delta.gitConfig) {
     const doGit = await p.confirm({
       message: "Set git to use delta for diffs? (writes to your global ~/.gitconfig)",
       initialValue: true,
