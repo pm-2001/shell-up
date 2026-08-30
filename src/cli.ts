@@ -1,5 +1,7 @@
 import pc from "picocolors";
 import { init } from "./commands/init.js";
+import { welcome } from "./commands/welcome.js";
+import { configExists } from "./core/config.js";
 import { doctor } from "./commands/doctor.js";
 import { theme } from "./commands/theme.js";
 import { applyCommand } from "./commands/apply.js";
@@ -17,6 +19,7 @@ function help(): void {
   ${pc.bold("Commands")}
     ${pc.cyan("init")}              Set up your shell — interactive, backs up your .zshrc
     ${pc.cyan("doctor")}            Check what's wired up and what isn't
+    ${pc.cyan("welcome")}           What shellup does, and set it up
     ${pc.cyan("theme")} ${pc.dim("[name]")}      Switch prompt theme ${pc.dim("(" + THEMES.map((t) => t.name).join(", ") + ")")}
     ${pc.cyan("apply")}             Regenerate shell files from config.json
     ${pc.cyan("uninstall")}         Remove the .zshrc block, optionally the config too
@@ -44,8 +47,15 @@ async function main(): Promise<void> {
 
   switch (command) {
     case undefined:
+      // A bare `shellup` on a fresh machine should explain itself; once set up,
+      // it goes straight to reconfiguring.
+      return configExists()
+        ? init({ yes: flags.has("-y") || flags.has("--yes") })
+        : welcome({ yes: flags.has("-y") || flags.has("--yes") });
     case "init":
       return init({ yes: flags.has("-y") || flags.has("--yes") });
+    case "welcome":
+      return welcome({ yes: flags.has("-y") || flags.has("--yes") });
     case "doctor":
       return doctor();
     case "theme":

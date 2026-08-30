@@ -18,9 +18,11 @@ function bail(value: unknown): void {
   }
 }
 
-export async function init(opts: { yes?: boolean } = {}): Promise<void> {
-  console.log();
-  p.intro(banner(version()));
+export async function init(opts: { yes?: boolean; skipIntro?: boolean } = {}): Promise<void> {
+  if (!opts.skipIntro) {
+    console.log();
+    p.intro(banner(version()));
+  }
 
   const env = detect();
   const existing = loadConfig();
