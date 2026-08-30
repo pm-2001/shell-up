@@ -4,8 +4,10 @@ Level up your terminal in 60 seconds — a fast async prompt, modern tool swaps,
 sane zsh defaults, installed by one command and fully reversible by another.
 
 ```bash
-npx shellup init
+npx @pm-2001/shellup init
 ```
+
+The package is scoped, but the command it installs is just `shellup`.
 
 No framework to adopt, no dotfiles repo to fork, and **three lines** added to your
 `.zshrc`. Everything else lives in `~/.config/shellup`.
