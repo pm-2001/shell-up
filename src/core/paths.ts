@@ -20,7 +20,17 @@ export const BACKUP_DIR = join(CONFIG_DIR, "backups");
 
 export const home = () => HOME;
 
+/** True for HOME itself or a path inside it. A bare prefix test would also match /Users/me2. */
+function underHome(p: string): boolean {
+  return p === HOME || p.startsWith(HOME + "/");
+}
+
 /** Render an absolute path with `~` so wizard output stays narrow. */
 export function tilde(p: string): string {
-  return p.startsWith(HOME) ? "~" + p.slice(HOME.length) : p;
+  return underHome(p) ? "~" + p.slice(HOME.length) : p;
+}
+
+/** The same path as generated zsh should spell it: $HOME-relative when it lives under HOME. */
+export function toShellPath(p: string): string {
+  return underHome(p) ? "$HOME" + p.slice(HOME.length) : p;
 }

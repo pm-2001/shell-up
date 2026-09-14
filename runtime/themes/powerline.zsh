@@ -5,9 +5,11 @@
 typeset -g SHELLUP_CTX_PROMPT=""
 
 shellup_theme_render() {
+  # Branch and venv names come from outside, and zsh reads a literal % in them as a
+  # prompt escape (feat/100%-done rendered as feat/100/<cwd>one), so double it.
   local s=""
   if [[ -n $SHELLUP_GIT_BRANCH ]]; then
-    local body=" ${SHELLUP_GIT_BRANCH}"
+    local body=" ${SHELLUP_GIT_BRANCH//\%/%%}"
     (( SHELLUP_GIT_STAGED ))     && body+=" +${SHELLUP_GIT_STAGED}"
     (( SHELLUP_GIT_UNSTAGED ))   && body+=" !${SHELLUP_GIT_UNSTAGED}"
     (( SHELLUP_GIT_UNTRACKED ))  && body+=" ?${SHELLUP_GIT_UNTRACKED}"
@@ -27,7 +29,7 @@ shellup_theme_render() {
   SHELLUP_GIT_PROMPT=$s
 
   local ctx=""
-  [[ -n $SHELLUP_VENV ]] && ctx=" %F{184} ${SHELLUP_VENV}%f"
+  [[ -n $SHELLUP_VENV ]] && ctx=" %F{184} ${SHELLUP_VENV//\%/%%}%f"
   SHELLUP_CTX_PROMPT=$ctx
 }
 

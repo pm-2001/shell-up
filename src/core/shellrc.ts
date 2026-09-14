@@ -1,25 +1,75 @@
 import { readFileSync, writeFileSync, existsSync, mkdirSync, copyFileSync } from "node:fs";
 import { join } from "node:path";
-import { BACKUP_DIR, INIT_FILE, tilde } from "./paths.js";
+import { BACKUP_DIR, INIT_FILE, tilde, toShellPath } from "./paths.js";
 
 const START = "# >>> shellup >>>";
 const END = "# <<< shellup <<<";
+
+/** The rc file is in a shape shellup won't edit. The message is written for the user. */
+export class RcFileError extends Error {}
 
 /**
  * The only thing shellup ever adds to your rc file. Everything else lives in
  * ~/.config/shellup, so the footprint in a file you also hand-edit is 3 lines.
  */
-function block(): string {
+function blockLines(): string[] {
+  const init = toShellPath(INIT_FILE);
   return [
     START,
     "# Managed by shellup — edit ~/.config/shellup/config.json, then run `shellup apply`.",
-    `[ -f "${INIT_FILE.replace(process.env.HOME ?? "", "$HOME")}" ] && source "${INIT_FILE.replace(process.env.HOME ?? "", "$HOME")}"`,
+    `[ -f "${init}" ] && source "${init}"`,
     END,
-  ].join("\n");
+  ];
+}
+
+interface Span {
+  start: number;
+  end: number;
+}
+
+type Scan = { ok: true; spans: Span[] } | { ok: false; line: number };
+
+/**
+ * Markers count only as whole lines, with the same test everywhere, so a
+ * commented-out or quoted copy of the marker text is never taken for the block.
+ * A start with no end (or a second start before the end) is reported, never
+ * guessed at: guessing is how everything after the marker used to get deleted.
+ */
+function scan(lines: string[]): Scan {
+  const spans: Span[] = [];
+  let open = -1;
+  for (let i = 0; i < lines.length; i++) {
+    const text = lines[i]!.trim();
+    if (text === START) {
+      if (open !== -1) return { ok: false, line: open + 1 };
+      open = i;
+    } else if (text === END && open !== -1) {
+      spans.push({ start: open, end: i });
+      open = -1;
+    }
+  }
+  return open === -1 ? { ok: true, spans } : { ok: false, line: open + 1 };
+}
+
+function malformed(rcFile: string, line: number): RcFileError {
+  return new RcFileError(
+    `${tilde(rcFile)} has a "${START}" line (line ${line}) with no "${END}" after it.\n` +
+      `  shellup can't tell where its block ends, so it won't edit the file and risk your lines.\n` +
+      `  Put the end marker back, or delete the start marker, then run this again.`,
+  );
+}
+
+export type BlockState = "present" | "absent" | { malformedAt: number };
+
+export function inspectBlock(rcFile: string): BlockState {
+  if (!existsSync(rcFile)) return "absent";
+  const result = scan(readFileSync(rcFile, "utf8").split("\n"));
+  if (!result.ok) return { malformedAt: result.line };
+  return result.spans.length ? "present" : "absent";
 }
 
 export function hasBlock(rcFile: string): boolean {
-  return existsSync(rcFile) && readFileSync(rcFile, "utf8").includes(START);
+  return inspectBlock(rcFile) === "present";
 }
 
 /**
@@ -36,44 +86,57 @@ export function backupRc(rcFile: string): string | null {
   return dest;
 }
 
-function stripBlock(content: string): string {
-  const lines = content.split("\n");
-  const out: string[] = [];
-  let inside = false;
-  for (const line of lines) {
-    if (line.trim() === START) {
-      inside = true;
-      // installBlock adds a blank spacer line before the block; take it back out
-      // so an install/uninstall round-trip returns the file byte-for-byte.
-      if (out.length && out[out.length - 1]!.trim() === "") out.pop();
-      continue;
-    }
-    if (line.trim() === END) { inside = false; continue; }
-    if (!inside) out.push(line);
+/**
+ * Idempotent. An existing block is rewritten where it already sits: moving it to
+ * the end would put shellup after config you deliberately placed below it, and let
+ * it override your prompt or plugins. With no block, one is appended.
+ */
+export function installBlock(rcFile: string): { backup: string | null; replaced: boolean; changed: boolean } {
+  const original = existsSync(rcFile) ? readFileSync(rcFile, "utf8") : "";
+  const lines = original.split("\n");
+  const result = scan(lines);
+  if (!result.ok) throw malformed(rcFile, result.line);
+
+  let next: string;
+  const replaced = result.spans.length > 0;
+  if (replaced) {
+    const out = [...lines];
+    // Drop any extra copies from the bottom up so earlier indices stay valid, then
+    // rewrite the first block in place.
+    for (const span of result.spans.slice(1).reverse()) out.splice(span.start, span.end - span.start + 1);
+    const first = result.spans[0]!;
+    out.splice(first.start, first.end - first.start + 1, ...blockLines());
+    next = out.join("\n");
+  } else {
+    next = original;
+    if (next.length && !next.endsWith("\n")) next += "\n";
+    next += (next.trim() ? "\n" : "") + blockLines().join("\n") + "\n";
   }
-  return out.join("\n");
-}
 
-/** Idempotent: replaces an existing block in place, or appends a new one. */
-export function installBlock(rcFile: string): { backup: string | null; replaced: boolean } {
-  const existed = existsSync(rcFile);
-  const original = existed ? readFileSync(rcFile, "utf8") : "";
-  const replaced = original.includes(START);
+  // Nothing to change means nothing to back up: `apply` shouldn't pile up copies.
+  if (next === original) return { backup: null, replaced, changed: false };
   const backup = backupRc(rcFile);
-
-  let next = replaced ? stripBlock(original) : original;
-  if (next.length && !next.endsWith("\n")) next += "\n";
-  next += (next.trim() ? "\n" : "") + block() + "\n";
-
   writeFileSync(rcFile, next, "utf8");
-  return { backup, replaced };
+  return { backup, replaced, changed: true };
 }
 
 export function removeBlock(rcFile: string): { backup: string | null; removed: boolean } {
-  if (!hasBlock(rcFile)) return { backup: null, removed: false };
+  if (!existsSync(rcFile)) return { backup: null, removed: false };
+  const original = readFileSync(rcFile, "utf8");
+  const lines = original.split("\n");
+  const result = scan(lines);
+  if (!result.ok) throw malformed(rcFile, result.line);
+  if (!result.spans.length) return { backup: null, removed: false };
+
+  const out = [...lines];
+  for (const span of [...result.spans].reverse()) {
+    let start = span.start;
+    // installBlock adds one blank spacer line before an appended block; take it back
+    // out so an install/uninstall round-trip returns the file byte-for-byte.
+    if (start > 0 && out[start - 1]!.trim() === "") start--;
+    out.splice(start, span.end - start + 1);
+  }
   const backup = backupRc(rcFile);
-  writeFileSync(rcFile, stripBlock(readFileSync(rcFile, "utf8")), "utf8");
+  writeFileSync(rcFile, out.join("\n"), "utf8");
   return { backup, removed: true };
 }
-
-export const describeBlock = () => `3 lines in ${tilde("~/.zshrc")}`;

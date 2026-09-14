@@ -67,6 +67,27 @@ function detectNerdFont(): boolean {
   }
 }
 
+/**
+ * zsh reads $ZDOTDIR/.zshrc when ZDOTDIR is set, and people usually set it in
+ * ~/.zshenv without exporting it, so this process can't see it. A non-interactive
+ * `zsh -c` still reads ~/.zshenv, so ask zsh itself.
+ */
+export function rcFilePath(): string {
+  const fallback = join(process.env.ZDOTDIR || homedir(), ".zshrc");
+  try {
+    const out = execFileSync("zsh", ["-c", 'print -r -- "${ZDOTDIR:-$HOME}"'], {
+      encoding: "utf8",
+      stdio: ["ignore", "pipe", "ignore"],
+      timeout: 5000,
+    });
+    // ~/.zshenv may print things of its own; the answer is the last line.
+    const dir = out.trim().split("\n").pop()?.trim();
+    return dir ? join(dir, ".zshrc") : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
 export function detect(): Environment {
   const os = platform();
   const shell = process.env.SHELL ?? "";
@@ -75,7 +96,7 @@ export function detect(): Environment {
     os: os === "darwin" ? "macos" : os === "linux" ? "linux" : "other",
     shell,
     isZsh: shell.includes("zsh"),
-    rcFile: join(homedir(), ".zshrc"),
+    rcFile: rcFilePath(),
     packageManager: detectPackageManager(),
     nerdFont: detectNerdFont(),
     terminal: process.env.TERM_PROGRAM ?? process.env.TERM ?? "unknown",

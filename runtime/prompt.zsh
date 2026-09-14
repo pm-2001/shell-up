@@ -22,6 +22,8 @@ typeset -gi SHELLUP_GIT_CONFLICTED=0 SHELLUP_GIT_AHEAD=0 SHELLUP_GIT_BEHIND=0
 typeset -gi SHELLUP_GIT_STASH=0 SHELLUP_GIT_LOADING=0
 typeset -g SHELLUP_GIT_PROMPT="" SHELLUP_DURATION="" SHELLUP_VENV=""
 typeset -gi _shellup_async_fd=0 _shellup_timer=0
+typeset -g  _shellup_async_root=""   # repo the in-flight worker is reading
+typeset -gi _shellup_async_dirty=0   # a command ran since that worker started
 
 : ${SHELLUP_SLOW_THRESHOLD:=3}
 
@@ -35,6 +37,10 @@ _shellup_git_reset() {
 # Runs in a background process. Prints one space-separated line; "-" means empty,
 # so every field stays at a fixed position and the reader needs no parsing rules.
 _shellup_git_worker() {
+  # A background `git status` otherwise takes .git/index.lock to refresh the index,
+  # which can make a `git commit` or `git add` you run at that moment fail with
+  # "index.lock: File exists". This runs in a subshell, so the export can't leak.
+  export GIT_OPTIONAL_LOCKS=0
   builtin cd -q "$1" 2>/dev/null || return
   local line xy branch="-" action="-" rest
   local -i staged=0 unstaged=0 untracked=0 conflicted=0 ahead=0 behind=0 stash=0
@@ -75,11 +81,12 @@ _shellup_git_worker() {
   print -r -- "$staged $unstaged $untracked $conflicted $ahead $behind $stash $action $branch"
 }
 
-_shellup_async_stop() {
-  (( _shellup_async_fd )) || return 0
-  zle -F $_shellup_async_fd 2>/dev/null
-  exec {_shellup_async_fd}<&- 2>/dev/null
-  _shellup_async_fd=0
+# Starts the single background worker. Only called when none is in flight.
+_shellup_async_start() {
+  _shellup_async_root=$1
+  _shellup_async_dirty=0
+  exec {_shellup_async_fd}< <( _shellup_git_worker "$1" )
+  zle -F $_shellup_async_fd _shellup_async_callback
 }
 
 # Fired by zle when the worker has written its line (or hung up).
@@ -87,10 +94,21 @@ _shellup_async_callback() {
   local fd=$1 data
   IFS= read -r data <&$fd
   zle -F $fd 2>/dev/null
-  exec {fd}<&- 2>/dev/null
+  # No `2>/dev/null` on this exec. With no command, exec applies its redirects to
+  # the shell itself, permanently: it would close the fd AND send the shell's
+  # stderr to /dev/null for the rest of the session, silencing `git push`, server
+  # logs and every error message after it. The fd is always open here.
+  exec {fd}<&-
   _shellup_async_fd=0
-  SHELLUP_GIT_LOADING=0
 
+  # The user moved to another repo, or out of git, while this was running, so the
+  # result describes a directory they have already left.
+  if [[ $_shellup_async_root != "$SHELLUP_GIT_ROOT" ]]; then
+    [[ -n $SHELLUP_GIT_ROOT ]] && _shellup_async_start "$SHELLUP_GIT_ROOT"
+    return 0
+  fi
+
+  local -i rerun=$_shellup_async_dirty
   if [[ -n $data ]]; then
     local -a f=( ${=data} )
     SHELLUP_GIT_STAGED=$f[1];     SHELLUP_GIT_UNSTAGED=$f[2]
@@ -100,9 +118,15 @@ _shellup_async_callback() {
     [[ $f[8] != '-' ]] && SHELLUP_GIT_ACTION=$f[8] || SHELLUP_GIT_ACTION=""
     [[ $f[9] != '-' ]] && SHELLUP_GIT_BRANCH=$f[9]
   fi
+  # A command ran after this worker started, so these counts may already be stale:
+  # show them, stay in the loading state, and read the repo once more.
+  SHELLUP_GIT_LOADING=$rerun
 
   shellup_theme_render
   zle && zle reset-prompt
+  if (( rerun )); then
+    _shellup_async_start "$SHELLUP_GIT_ROOT"
+  fi
 }
 
 _shellup_preexec() {
@@ -126,8 +150,6 @@ _shellup_precmd() {
   SHELLUP_VENV=""
   [[ -n $VIRTUAL_ENV ]] && SHELLUP_VENV=${VIRTUAL_ENV:t}
 
-  _shellup_async_stop
-
   # The one synchronous git call: cheap even in a huge repo.
   local -a info
   info=( ${(f)"$(command git rev-parse --show-toplevel --abbrev-ref HEAD 2>/dev/null)"} )
@@ -146,14 +168,20 @@ _shellup_precmd() {
       || branch="@$(command git rev-parse --short HEAD 2>/dev/null)"
   fi
   # Leaving a repo must clear counts, or the old repo's state bleeds into the new prompt.
-  [[ $root != $SHELLUP_GIT_ROOT ]] && _shellup_git_reset
+  [[ $root != "$SHELLUP_GIT_ROOT" ]] && _shellup_git_reset
   SHELLUP_GIT_ROOT=$root
   SHELLUP_GIT_BRANCH=$branch
   SHELLUP_GIT_LOADING=1
   shellup_theme_render
 
-  exec {_shellup_async_fd}< <( _shellup_git_worker "$root" )
-  zle -F $_shellup_async_fd _shellup_async_callback
+  # One worker at a time. In a repo where `git status` is slow, starting a fresh one
+  # on every Enter stacks them up (ten presses meant eleven at once); instead, mark
+  # the in-flight result stale and let the callback read the repo once more.
+  if (( _shellup_async_fd )); then
+    _shellup_async_dirty=1
+  else
+    _shellup_async_start "$root"
+  fi
 }
 
 zmodload zsh/datetime 2>/dev/null

@@ -15,6 +15,8 @@ on:
 
 jobs:
   publish:
+    # A manual run publishes whatever the chosen branch holds, so only allow main.
+    if: github.event_name == 'release' || github.ref == 'refs/heads/main'
     # Pure TypeScript build, so no need for a macOS runner here.
     runs-on: ubuntu-latest
     permissions:
@@ -26,8 +28,22 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           registry-url: https://registry.npmjs.org
+      # Fail in seconds with the reason, rather than building and then hitting npm's
+      # E403 "cannot publish over the previously published versions".
+      - name: Check the version is new and matches the release tag
+        run: |
+          name="$(node -p "require('./package.json').name")"
+          version="$(node -p "require('./package.json').version")"
+          if [ "$GITHUB_EVENT_NAME" = "release" ] && [ "$GITHUB_REF_NAME" != "v$version" ]; then
+            echo "::error::Release tag $GITHUB_REF_NAME doesn't match package.json version v$version."
+            exit 1
+          fi
+          if [ -n "$(npm view "$name@$version" version 2>/dev/null)" ]; then
+            echo "::error::$name@$version is already on npm. Bump the version in package.json, then release again."
+            exit 1
+          fi
       - run: npm ci
       # `npm publish` runs prepublishOnly (typecheck + build) before uploading.
       - run: npm publish --provenance --access public

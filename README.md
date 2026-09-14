@@ -60,6 +60,10 @@ $ git pus­h origin main        ← "h origin main" is grey; → accepts
 [fd](https://github.com/sharkdp/fd), [ripgrep](https://github.com/BurntSushi/ripgrep),
 [git-delta](https://github.com/dandavison/delta), [zsh-autosuggestions](https://github.com/zsh-users/zsh-autosuggestions), lazygit, btop, jq, tldr.
 
+`ls` and `cat` switch to eza and bat only when you're looking at the output. Pipes, redirects,
+and flags that mean something different there still get the real commands, so scripts and
+muscle memory keep working.
+
 **zsh defaults worth having**: 100k lines of shared, deduplicated history; completion
 with case-insensitive matching and a menu; `auto_cd` and a directory stack; prefix-aware
 history search on <kbd>↑</kbd>; word-wise movement that survives ssh; `Ctrl-Z` to toggle
@@ -81,7 +85,8 @@ shellup uninstall     # remove cleanly
 ## What it touches
 
 ```
-~/.zshrc                          3 lines, in a marked block, appended
+~/.zshrc                          3 lines, in a marked block (or $ZDOTDIR/.zshrc if you set it)
+~/.gitconfig                      delta settings, only if you say yes; uninstall offers to undo them
 ~/.config/shellup/
   config.json                     your choices
   init.zsh                        generated entry point
@@ -110,7 +115,7 @@ leaves the file byte-for-byte as it was.
 
 ## Requirements
 
-zsh, and Node 18+ to run the installer. macOS or Linux. Tool installation uses whichever
+zsh, and Node 20.12+ to run the installer. macOS or Linux. Tool installation uses whichever
 of `brew`, `apt`, `dnf` or `pacman` you have — without one, shellup still writes the
 config and the integrations activate on their own once the tools reach your `PATH`.
 

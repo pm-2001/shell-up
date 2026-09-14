@@ -9,6 +9,14 @@ import { uninstall } from "./commands/uninstall.js";
 import { version } from "./core/render.js";
 import { THEMES } from "./themes/index.js";
 
+const COMMANDS = ["init", "welcome", "doctor", "theme", "apply", "uninstall", "help"];
+const GLOBAL_FLAGS = ["-h", "--help", "-v", "--version"];
+/** Flags each command understands. A bare `shellup` behaves like init. */
+const COMMAND_FLAGS: Record<string, string[]> = {
+  init: ["-y", "--yes"],
+  welcome: ["-y", "--yes"],
+};
+
 function help(): void {
   console.log(`
   ${pc.bgCyan(pc.black(" shellup "))} ${pc.dim("v" + version())}   ${pc.dim("a beautiful, fast zsh in one command")}
@@ -25,7 +33,7 @@ function help(): void {
     ${pc.cyan("uninstall")}         Remove the .zshrc block, optionally the config too
 
   ${pc.bold("Flags")}
-    ${pc.cyan("-y, --yes")}         Skip the install confirmation during init
+    ${pc.cyan("-y, --yes")}         Skip the install confirmation (init only)
     ${pc.cyan("-v, --version")}     Print version
     ${pc.cyan("-h, --help")}        This message
 
@@ -36,26 +44,44 @@ function help(): void {
 
 async function main(): Promise<void> {
   const argv = process.argv.slice(2);
-  const flags = new Set(argv.filter((a) => a.startsWith("-")));
+  const flags = argv.filter((a) => a.startsWith("-"));
   const [command, ...rest] = argv.filter((a) => !a.startsWith("-"));
 
-  if (flags.has("-v") || flags.has("--version")) {
+  if (command !== undefined && !COMMANDS.includes(command)) {
+    console.error(`\n  ${pc.red("Unknown command:")} ${command}\n  Run ${pc.cyan("shellup --help")} to see what's available.\n`);
+    process.exitCode = 2;
+    return;
+  }
+
+  // Refuse flags a command doesn't understand: `apply --dry-run` used to run a real
+  // apply and edit your .zshrc.
+  const allowed = [...GLOBAL_FLAGS, ...(COMMAND_FLAGS[command ?? "init"] ?? [])];
+  const unknown = flags.filter((f) => !allowed.includes(f));
+  if (unknown.length) {
+    console.error(
+      `\n  ${pc.red("Unknown option:")} ${unknown[0]}${command ? ` for ${pc.cyan(command)}` : ""}` +
+        `\n  Run ${pc.cyan("shellup --help")} to see what's available.\n`,
+    );
+    process.exitCode = 2;
+    return;
+  }
+
+  if (flags.includes("-v") || flags.includes("--version")) {
     console.log(version());
     return;
   }
-  if (flags.has("-h") || flags.has("--help")) return help();
+  if (flags.includes("-h") || flags.includes("--help")) return help();
+  const yes = flags.includes("-y") || flags.includes("--yes");
 
   switch (command) {
     case undefined:
       // A bare `shellup` on a fresh machine should explain itself; once set up,
       // it goes straight to reconfiguring.
-      return configExists()
-        ? init({ yes: flags.has("-y") || flags.has("--yes") })
-        : welcome({ yes: flags.has("-y") || flags.has("--yes") });
+      return configExists() ? init({ yes }) : welcome({ yes });
     case "init":
-      return init({ yes: flags.has("-y") || flags.has("--yes") });
+      return init({ yes });
     case "welcome":
-      return welcome({ yes: flags.has("-y") || flags.has("--yes") });
+      return welcome({ yes });
     case "doctor":
       return doctor();
     case "theme":
@@ -66,13 +92,10 @@ async function main(): Promise<void> {
       return uninstall();
     case "help":
       return help();
-    default:
-      console.error(`\n  ${pc.red("Unknown command:")} ${command}\n  Run ${pc.cyan("shellup --help")} to see what's available.\n`);
-      process.exitCode = 1;
   }
 }
 
 main().catch((err: unknown) => {
-  console.error(`\n  ${pc.red("shellup failed:")} ${err instanceof Error ? err.message : String(err)}\n`);
+  console.error(`\n  ${pc.red("✖")} ${err instanceof Error ? err.message : String(err)}\n`);
   process.exitCode = 1;
 });

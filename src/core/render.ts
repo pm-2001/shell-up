@@ -1,7 +1,7 @@
 import { writeFileSync, mkdirSync, cpSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
-import { CONFIG_DIR, GENERATED_DIR, RUNTIME_DIR, INIT_FILE, PKG_ROOT } from "./paths.js";
-import { toolById } from "./tools.js";
+import { CONFIG_DIR, GENERATED_DIR, RUNTIME_DIR, INIT_FILE, PKG_ROOT, toShellPath } from "./paths.js";
+import { toolById, binNames } from "./tools.js";
 import type { Config } from "./config.js";
 
 export function version(): string {
@@ -42,7 +42,8 @@ function renderTools(config: Config): string {
 
     // A binary: guarded so an uninstalled or later-removed tool is a no-op,
     // never a broken shell.
-    parts.push(rule + `if command -v ${tool.bin} >/dev/null 2>&1; then\n` + indent(tool.snippet!) + `\nfi\n`);
+    const guard = binNames(tool).map((name) => `command -v ${name} >/dev/null 2>&1`).join(" || ");
+    parts.push(rule + `if ${guard}; then\n` + indent(tool.snippet!) + `\nfi\n`);
   }
   return parts.join("");
 }
@@ -51,7 +52,7 @@ function renderInit(config: Config): string {
   const lines = [
     HEADER(version()),
     "",
-    `export SHELLUP_DIR="\${SHELLUP_DIR:-${CONFIG_DIR.replace(process.env.HOME ?? "", "$HOME")}}"`,
+    `export SHELLUP_DIR="\${SHELLUP_DIR:-${toShellPath(CONFIG_DIR)}}"`,
     `export SHELLUP_VERSION="${version()}"`,
     "",
     "# Non-interactive shells (scripts, scp, rsync) get nothing: sourcing a prompt",
