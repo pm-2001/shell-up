@@ -6,15 +6,17 @@ import { doctor } from "./commands/doctor.js";
 import { theme } from "./commands/theme.js";
 import { applyCommand } from "./commands/apply.js";
 import { uninstall } from "./commands/uninstall.js";
+import { redis } from "./commands/redis.js";
 import { version } from "./core/render.js";
 import { THEMES } from "./themes/index.js";
 
-const COMMANDS = ["init", "welcome", "doctor", "theme", "apply", "uninstall", "help"];
+const COMMANDS = ["init", "welcome", "doctor", "theme", "apply", "uninstall", "redis", "help"];
 const GLOBAL_FLAGS = ["-h", "--help", "-v", "--version"];
 /** Flags each command understands. A bare `shellup` behaves like init. */
 const COMMAND_FLAGS: Record<string, string[]> = {
   init: ["-y", "--yes"],
   welcome: ["-y", "--yes"],
+  redis: ["--read-only", "--monitor", "--no-monitor"],
 };
 
 function help(): void {
@@ -31,9 +33,13 @@ function help(): void {
     ${pc.cyan("theme")} ${pc.dim("[name]")}      Switch prompt theme ${pc.dim("(" + THEMES.map((t) => t.name).join(", ") + ")")}
     ${pc.cyan("apply")}             Regenerate shell files from config.json
     ${pc.cyan("uninstall")}         Remove the .zshrc block, optionally the config too
+    ${pc.cyan("redis")} ${pc.dim("[url]")}       Live view of a Redis: keys, values, activity, stats
 
   ${pc.bold("Flags")}
     ${pc.cyan("-y, --yes")}         Skip the install confirmation (init only)
+    ${pc.cyan("--read-only")}       redis: look, but never change anything
+    ${pc.cyan("--monitor")}         redis: show live activity on a remote server too
+    ${pc.cyan("--no-monitor")}      redis: no live activity feed
     ${pc.cyan("-v, --version")}     Print version
     ${pc.cyan("-h, --help")}        This message
 
@@ -90,6 +96,11 @@ async function main(): Promise<void> {
       return applyCommand();
     case "uninstall":
       return uninstall();
+    case "redis":
+      return redis(rest[0], {
+        readOnly: flags.includes("--read-only"),
+        monitor: flags.includes("--monitor") ? true : flags.includes("--no-monitor") ? false : undefined,
+      });
     case "help":
       return help();
   }

@@ -80,7 +80,38 @@ shellup doctor        # what's wired up, what isn't, and how to fix it
 shellup theme neon    # switch prompt theme
 shellup apply         # regenerate after hand-editing config.json
 shellup uninstall     # remove cleanly
+shellup redis         # live view of your local Redis
 ```
+
+## A live view of Redis
+
+```bash
+shellup redis                       # localhost:6379
+shellup redis localhost:6380/2      # another port, database 2
+shellup redis redis://:pass@host:6379 --read-only
+```
+
+A full-screen view that stays live until you press `q`, for seeing what your app
+actually caches while it runs:
+
+- **Keys**: every key grouped by prefix (`user:`, `cache:`, `session:`), with its type,
+  TTL counting down, size and memory. Keys appear, change and disappear as your app
+  writes them. Every type is readable: strings (JSON pretty-printed, binary as hex),
+  hashes (with per-field TTLs), lists, sets, sorted sets, streams, vector sets, and
+  RedisJSON / time series where the modules are installed.
+- **Activity**: every command your apps send, as they send it, plus keys expiring and
+  being evicted. Pause it, filter it, or jump from a command to its key.
+- **Server**: memory, ops/s, cache hit rate, most-used commands, the slow log, clients.
+- **Pub/Sub**: channels with subscribers, every message published, and a way to publish.
+
+Delete a key, a whole prefix, or everything matching a filter (always confirmed); set a
+TTL; rename; edit a short string; copy a value; switch database. `?` lists every key.
+
+It stays out of your way: listing uses `SCAN`, never `KEYS`; shellup's own commands are
+hidden from the activity feed; and the one setting it changes to see key changes live
+(`notify-keyspace-events`) goes back to how it was when you quit. The activity feed uses
+`MONITOR`, which can slow a busy server, so it's on by default only for a Redis on your
+own machine. `--read-only` changes nothing at all.
 
 ## What it touches
 
