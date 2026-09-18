@@ -42,7 +42,8 @@ interface Message {
 interface ValueContent {
   head?: string;
   lines: string[];
-  details: string[];
+  /** The whole entry for row i, built only when asked for (⏎ or copy). */
+  detail: (i: number) => string;
   foot?: string;
 }
 
@@ -137,12 +138,26 @@ function wholeText(v: d.Value): string {
   }
 }
 
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  const expire = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error("timed out")), ms);
+  });
+  return Promise.race([p, expire]).finally(() => clearTimeout(timer));
+}
+
 export class RedisApp {
   private screen = new Screen();
   private conn!: RedisConn;
   private mon: RedisConn | null = null;
   private sub: RedisConn | null = null;
+  /** How Redis sees shellup's own connections, so its commands can be kept out of the feed. */
+  private ownAddrs = new Set<string>();
+  /** Fallback when a server can't say (before Redis 5): shellup's local ports. */
   private ownPorts = new Set<number>();
+  private monId: number | null = null;
+  /** The activity feed stays off until then after Redis queued more than shellup could read. */
+  private monitorBusyUntil = 0;
   private started = false;
   private exiting = false;
   private connected = false;
@@ -152,6 +167,9 @@ export class RedisApp {
   private startingMonitor = false;
   /** notify-keyspace-events as it was before shellup changed it; null when untouched. */
   private notifyOriginal: string | null = null;
+  /** The value shellup last set. On exit, a different value means someone else changed it since. */
+  private notifySet: string | null = null;
+  private flagsOk = false;
   private notifyNote = "";
   private db: number;
 
@@ -170,7 +188,13 @@ export class RedisApp {
   private labels = new Map<string, string>();
   private truncated = false;
   private scanning = false;
-  private scanInFlight = false;
+  private scanPromise: Promise<void> | null = null;
+  private scanAgain = false;
+  private scanLoud = false;
+  /** Key events that arrive while a scan walks the keyspace; replayed onto its result. */
+  private scanEvents: Map<string, "add" | "remove"> | null = null;
+  private countMismatch = 0;
+  private reselect = false;
   private pendingAdd = new Set<string>();
   private pendingRemove = new Set<string>();
   private rowsDirty = true;
@@ -192,14 +216,18 @@ export class RedisApp {
   private valueTop = 0;
   private valueLen = 0;
   private valuePage = 10;
-  private valueDetails: string[] = [];
+  private valueDetail: (i: number) => string = () => "";
+  /** Built once per value and width, not once per frame: pretty JSON and hex dumps of 500 rows add up. */
+  private valueCache: { value: d.Value; width: number; tick: number; content: ValueContent } | null = null;
+  private detailCache: { text: string; width: number; lines: string[] } | null = null;
 
   private activity: Entry[] = [];
   private actItems: Entry[] = [];
   private seq = 0;
   private paused: number | null = null;
   private activityFilter = "";
-  private actCursor: number | null = null;
+  /** The selected entry's seq, so trimming old entries never moves the selection. null follows the newest. */
+  private actSel: number | null = null;
   private actTop = 0;
   private actPage = 10;
 
@@ -242,11 +270,6 @@ export class RedisApp {
 
   /** Connects first (so a connection error prints normally), then takes over the terminal until you quit. */
   async run(): Promise<void> {
-    await this.connectMain();
-    await this.startEvents(false);
-    if (this.opts.monitor) await this.startMonitor(false);
-    await this.poll(true);
-
     const finished = new Promise<void>((resolve) => (this.done = resolve));
     const stop = () => void this.quit();
     const crash = (err: unknown) => {
@@ -254,23 +277,33 @@ export class RedisApp {
       console.error(err);
       void this.quit(1);
     };
-    process.on("SIGTERM", stop);
-    process.on("SIGHUP", stop);
+    const restoreTerminal = () => this.screen.stop();
+    // Installed before shellup changes anything on the server, so a Ctrl-C or a kill
+    // during startup still puts notify-keyspace-events back.
+    const signals: NodeJS.Signals[] = ["SIGINT", "SIGTERM", "SIGHUP", "SIGQUIT"];
+    for (const sig of signals) process.on(sig, stop);
     process.on("uncaughtException", crash);
     process.on("unhandledRejection", crash);
-
-    this.screen.start((k) => this.onKey(k), () => this.render());
-    this.started = true;
-    this.timers.push(setInterval(() => void this.poll(false), 1000));
-    void this.rescan();
-    this.render();
+    process.on("exit", restoreTerminal);
     try {
+      await this.connectMain();
+      if (!this.exiting) await this.startEvents(false);
+      if (!this.exiting && this.opts.monitor) await this.startMonitor(false);
+      if (!this.exiting) await this.poll(true);
+      if (!this.exiting) {
+        this.screen.start((k) => this.onKey(k), () => this.render());
+        this.started = true;
+        this.timers.push(setInterval(() => void this.poll(false), 1000));
+        this.timers.push(setInterval(() => void this.checkMonitorBacklog(), 250));
+        void this.rescan();
+        this.render();
+      }
       await finished;
     } finally {
-      process.off("SIGTERM", stop);
-      process.off("SIGHUP", stop);
+      for (const sig of signals) process.off(sig, stop);
       process.off("uncaughtException", crash);
       process.off("unhandledRejection", crash);
+      process.off("exit", restoreTerminal);
     }
   }
 
@@ -290,21 +323,28 @@ export class RedisApp {
     this.done();
   }
 
-  /** Puts notify-keyspace-events back the way it was, so leaving shellup leaves Redis as it found it. */
+  /** Puts notify-keyspace-events back the way shellup found it, unless something else has changed it since. */
   private async restoreNotify(): Promise<void> {
     if (this.notifyOriginal === null) return;
     const original = this.notifyOriginal;
-    const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error("timed out")), 2000));
+    const t = this.opts.target;
+    let conn: RedisConn | null = null;
     try {
-      const conn = this.connected && !this.conn.closed ? this.conn : await RedisConn.connect(this.conf("shellup-redis-restore"));
-      await Promise.race([conn.call("CONFIG", "SET", "notify-keyspace-events", original), timeout]);
-      if (conn !== this.conn) conn.close();
+      conn = this.connected && !this.conn.closed ? this.conn : await withTimeout(RedisConn.connect(this.conf("shellup-redis-restore")), 2000);
+      const now = d.str(d.asList(await withTimeout(conn.call("CONFIG", "GET", "notify-keyspace-events"), 2000))[1]);
+      // Your app, or another shellup, changed it after shellup did: that newer value wins.
+      if (this.notifySet !== null && now !== this.notifySet) {
+        console.error(`notify-keyspace-events was changed while shellup was open, so it was left as "${now}".`);
+        return;
+      }
+      await withTimeout(conn.call("CONFIG", "SET", "notify-keyspace-events", original), 2000);
     } catch (err) {
-      const t = this.opts.target;
       console.error(
         `shellup couldn't restore notify-keyspace-events on ${t.address} (${err instanceof Error ? err.message : String(err)}).\n` +
           `Put it back with:  redis-cli -h ${t.host} -p ${t.port} CONFIG SET notify-keyspace-events "${original}"`,
       );
+    } finally {
+      if (conn && conn !== this.conn) conn.close();
     }
   }
 
@@ -315,18 +355,28 @@ export class RedisApp {
     return { host: t.host, port: t.port, tls: t.tls, username: t.username, password: t.password, db: this.db, name };
   }
 
-  private track(conn: RedisConn): void {
-    if (conn.localPort) this.ownPorts.add(conn.localPort);
+  /** Records the address Redis sees a connection on (and returns its client id). */
+  private async identify(conn: RedisConn): Promise<number | null> {
+    const who = await d.whoAmI(conn).catch(() => ({ id: null, addr: null }));
+    if (who.addr) this.ownAddrs.add(who.addr);
+    else if (conn.localPort) this.ownPorts.add(conn.localPort);
+    return who.id;
+  }
+
+  private isOwn(source: string): boolean {
+    if (this.ownAddrs.has(source)) return true;
+    const colon = source.lastIndexOf(":");
+    return colon !== -1 && this.ownPorts.has(Number(source.slice(colon + 1)));
   }
 
   private async connectMain(): Promise<void> {
     const conn = await RedisConn.connect(this.conf("shellup-redis"));
-    this.track(conn);
     conn.onClose(() => {
       if (conn === this.conn) this.onDisconnect();
     });
     this.conn = conn;
     this.connected = true;
+    await this.identify(conn);
   }
 
   /**
@@ -337,26 +387,11 @@ export class RedisApp {
   private async startEvents(quiet: boolean): Promise<void> {
     if (this.startingEvents || !this.connected) return;
     this.startingEvents = true;
-    let flagsOk = false;
     try {
-      const reply = d.asList(await this.conn.call("CONFIG", "GET", "notify-keyspace-events"));
-      const current = d.str(reply[1]);
-      const missing = [..."EA"].filter((c) => !current.includes(c));
-      if (!missing.length) flagsOk = true;
-      else if (this.opts.readOnly) this.notifyNote = "key events off (read-only)";
-      else {
-        await this.conn.call("CONFIG", "SET", "notify-keyspace-events", current + missing.join(""));
-        this.notifyOriginal ??= current;
-        this.notifyNote = "";
-        flagsOk = true;
-      }
-    } catch {
-      this.notifyNote = "key events unavailable";
-    }
-    try {
+      await this.ensureNotifyFlags();
       if (!this.sub) {
         const sub = await RedisConn.connect(this.conf("shellup-redis-events"));
-        this.track(sub);
+        await this.identify(sub);
         sub.onClose(() => {
           if (this.sub === sub) {
             this.sub = null;
@@ -369,18 +404,56 @@ export class RedisApp {
     } catch (err) {
       if (!quiet) this.toast(`Live key events unavailable: ${err instanceof Error ? err.message : String(err)}`, "err");
     } finally {
-      this.eventsLive = flagsOk && this.sub !== null;
+      this.eventsLive = this.flagsOk && this.sub !== null;
       this.startingEvents = false;
+    }
+  }
+
+  private async readNotify(): Promise<string> {
+    return d.str(d.asList(await this.conn.call("CONFIG", "GET", "notify-keyspace-events"))[1]);
+  }
+
+  /**
+   * Makes sure notify-keyspace-events has E (event channels) and A (every kind of
+   * change). Run at start and every few seconds, because your app or another shellup
+   * may change it. Returns true when it had to switch them back on.
+   */
+  private async ensureNotifyFlags(): Promise<boolean> {
+    try {
+      const current = await this.readNotify();
+      const missing = [..."EA"].filter((c) => !current.includes(c));
+      if (!missing.length) {
+        this.flagsOk = true;
+        return false;
+      }
+      if (this.opts.readOnly) {
+        this.flagsOk = false;
+        this.notifyNote = "key events off (read-only)";
+        return false;
+      }
+      // What goes back on exit is whatever was there just before shellup's latest
+      // change, so a value your app set in the meantime isn't thrown away.
+      this.notifyOriginal = current;
+      this.notifySet = null;
+      await this.conn.call("CONFIG", "SET", "notify-keyspace-events", current + missing.join(""));
+      this.notifySet = await this.readNotify();
+      this.flagsOk = true;
+      this.notifyNote = "";
+      return true;
+    } catch {
+      this.flagsOk = false;
+      this.notifyNote = "key events unavailable";
+      return false;
     }
   }
 
   /** MONITOR streams every command the server runs: that's the Activity feed. */
   private async startMonitor(quiet: boolean): Promise<void> {
-    if (this.startingMonitor || !this.connected) return;
+    if (this.startingMonitor || !this.connected || Date.now() < this.monitorBusyUntil) return;
     this.startingMonitor = true;
     try {
       const mon = await RedisConn.connect(this.conf("shellup-redis-monitor"));
-      this.track(mon);
+      const id = await this.identify(mon);
       mon.onClose(() => {
         if (this.mon === mon) {
           this.mon = null;
@@ -388,7 +461,9 @@ export class RedisApp {
         }
       });
       await mon.monitor((line) => this.onMonitor(line));
+      if (this.exiting) return mon.close();
       this.mon = mon;
+      this.monId = id;
       this.monitorLive = true;
     } catch (err) {
       this.monitorLive = false;
@@ -396,6 +471,27 @@ export class RedisApp {
     } finally {
       this.startingMonitor = false;
     }
+  }
+
+  /**
+   * MONITOR has no flow control: whatever shellup doesn't read piles up in Redis's own
+   * memory, and under maxmemory that can evict your keys. Checked four times a second;
+   * past a small limit the feed stops for 30 seconds and Redis frees the backlog.
+   */
+  private async checkMonitorBacklog(): Promise<void> {
+    if (!this.monitorLive || this.monId === null || !this.connected || this.exiting) return;
+    const line = d.str(await this.conn.call("CLIENT", "LIST", "ID", this.monId).catch(() => null));
+    const backlog = Number(/\bomem=(\d+)/.exec(line)?.[1] ?? 0);
+    const max = Number(this.info.memory?.maxmemory ?? 0);
+    const limit = max > 0 ? Math.max(1 << 20, Math.min(32 << 20, max * 0.05)) : 32 << 20;
+    if (backlog <= limit) return;
+    const mon = this.mon;
+    this.mon = null;
+    this.monId = null;
+    this.monitorLive = false;
+    mon?.close();
+    this.monitorBusyUntil = Date.now() + 30_000;
+    this.toast(`Activity paused for 30s: Redis was holding ${d.formatBytes(backlog)} of commands shellup couldn't read fast enough`, "err");
   }
 
   private onDisconnect(): void {
@@ -407,6 +503,9 @@ export class RedisApp {
     this.sub?.close();
     this.mon = null;
     this.sub = null;
+    this.monId = null;
+    this.ownAddrs.clear();
+    this.ownPorts.clear();
     this.schedule();
     const retry = async () => {
       if (this.exiting) return;
@@ -416,7 +515,7 @@ export class RedisApp {
         if (this.opts.monitor) await this.startMonitor(true);
         this.toast("Reconnected", "ok");
         this.meta.clear();
-        void this.rescan();
+        void this.rescan(true);
       } catch {
         this.retryTimer = setTimeout(() => void retry(), 1000);
       }
@@ -429,18 +528,21 @@ export class RedisApp {
 
   private onMonitor(line: string): void {
     const e = d.parseMonitorLine(line);
-    if (!e) return;
-    const colon = e.source.lastIndexOf(":");
     // shellup's own SCAN/TYPE/INFO would drown out your app, so they're hidden.
-    if (colon !== -1 && this.ownPorts.has(Number(e.source.slice(colon + 1)))) return;
+    if (!e || this.isOwn(e.source)) return;
     const cmd = (e.args[0] ?? "").toUpperCase();
     if (!cmd) return;
     const key = d.keyOf(cmd, e.args);
     this.cmdCounts.set(cmd, (this.cmdCounts.get(cmd) ?? 0) + 1);
     this.cmdTotal++;
     this.pushEntry({ at: e.at, db: e.db, kind: "cmd", source: e.source, cmd, args: e.args.slice(1), key });
+    // These change every key at once without sending a single key event.
+    if (cmd === "FLUSHDB" || cmd === "FLUSHALL" || cmd === "SWAPDB") {
+      this.meta.clear();
+      return this.scheduleQuietRescan(200);
+    }
     // Without key events, a write is the only hint the key list is out of date.
-    if (!this.eventsLive && key && e.db === this.db && !READ.test(cmd)) this.scheduleQuietRescan();
+    if (!this.eventsLive && key && e.db === this.db && !READ.test(cmd)) this.scheduleQuietRescan(1000);
   }
 
   private onMessage(channel: Buffer, message: Buffer): void {
@@ -469,7 +571,9 @@ export class RedisApp {
       this.pendingAdd.add(id);
       this.pendingRemove.delete(id);
     }
-    this.meta.delete(id);
+    this.scanEvents?.set(id, GONE.has(event) ? "remove" : "add");
+    const known = this.meta.get(id);
+    if (known) known.stale = true;
     this.flashes.set(id, Date.now() + FLASH_MS);
     if (id === this.selected) this.refreshValueSoon();
     this.schedule();
@@ -479,8 +583,12 @@ export class RedisApp {
     const args = e.args.map((a) => (a.length > 300 ? a.slice(0, 300) + "…" : a));
     this.activity.push({ ...e, args, seq: ++this.seq, got: Date.now(), search: `${e.cmd} ${args.join(" ")} ${e.source}`.toLowerCase() });
     if (this.activity.length > ACTIVITY_LIMIT + 500) {
-      this.activity.splice(0, 500);
-      if (this.actCursor !== null) this.actCursor = Math.max(0, this.actCursor - 500);
+      if (this.paused === null) this.activity.splice(0, 500);
+      else {
+        // While paused, what's on screen stays put; the oldest of what arrived since goes.
+        const first = this.activity.findIndex((x) => x.seq > this.paused!);
+        if (first !== -1) this.activity.splice(first, Math.min(500, this.activity.length - first - 1));
+      }
     }
     if (this.view !== "server") this.schedule();
   }
@@ -521,6 +629,23 @@ export class RedisApp {
           .map((b, i) => ({ name: d.printable(b), subs: d.num(counts[i * 2 + 1]) }))
           .sort((a, b) => (a.name < b.name ? -1 : 1));
       }
+      // Your app, or another shellup quitting, may have switched key events off again.
+      if (this.tick % 3 === 0 && this.sub) {
+        const reapplied = await this.ensureNotifyFlags();
+        this.eventsLive = this.flagsOk && this.sub !== null;
+        if (reapplied) void this.rescan(true); // events were missed while they were off
+      }
+      // A FLUSHDB, or events missed any other way, shows as a count that doesn't add up.
+      if (this.filter === "*" && !this.truncated && !this.scanPromise) {
+        this.applyPending();
+        const count = d.keyspace(info).get(this.db)?.keys ?? 0;
+        const off = Math.abs(count - this.ids.length) > Math.max(3, count * 0.001);
+        this.countMismatch = off ? this.countMismatch + 1 : 0;
+        if (this.countMismatch >= 2) {
+          this.countMismatch = 0;
+          void this.rescan(true);
+        }
+      }
       // Without key events the list can't update itself, so rescan every few seconds.
       if (!this.eventsLive && this.view === "keys" && this.tick % 3 === 0) void this.rescan(true);
       if (!this.eventsLive && this.selected && this.tick % 2 === 0) void this.loadValue(this.selected, true);
@@ -553,48 +678,93 @@ export class RedisApp {
     });
   }
 
-  private async rescan(quiet = false): Promise<void> {
-    if (this.scanInFlight || !this.connected) return;
-    this.scanInFlight = true;
-    this.scanning = !quiet;
-    this.schedule();
-    try {
-      const { ids, truncated } = await d.scanKeys(this.conn, this.filter, KEY_LIMIT);
-      this.ids = ids;
-      this.idSet = new Set(ids);
-      this.sortIds();
-      this.truncated = truncated;
-      this.pendingAdd.clear();
-      this.pendingRemove.clear();
-      this.rowsDirty = true;
-      if (!this.selected) {
-        this.applyPending();
-        this.rebuildRows();
-        const row = this.rows[this.cursor];
-        if (row?.kind === "key") this.select(row.id, true);
-      }
-    } catch (err) {
-      if (!quiet) this.toastErr(err);
-    } finally {
-      this.scanInFlight = false;
-      this.scanning = false;
-      this.schedule();
+  /**
+   * Rescans the keyspace. A request that arrives while a scan is running (a new
+   * filter, another database, r) restarts it rather than being dropped, so the list
+   * never shows one filter's keys under another's title.
+   */
+  private rescan(quiet = false): Promise<void> {
+    if (!this.connected) return Promise.resolve();
+    if (!quiet) {
+      this.scanning = true;
+      this.scanLoud = true;
     }
+    if (this.scanPromise) {
+      this.scanAgain = true;
+      this.schedule();
+      return this.scanPromise;
+    }
+    this.scanPromise = this.runScans().finally(() => {
+      this.scanPromise = null;
+      this.scanning = false;
+      this.scanLoud = false;
+      this.schedule();
+    });
+    return this.scanPromise;
   }
 
-  private scheduleQuietRescan(): void {
+  private async runScans(): Promise<void> {
+    do {
+      this.scanAgain = false;
+      const filter = this.filter;
+      const db = this.db;
+      const stale = () => this.scanAgain || this.exiting || filter !== this.filter || db !== this.db;
+      this.scanEvents = new Map();
+      this.schedule();
+      try {
+        const found = await d.scanKeys(this.conn, filter, KEY_LIMIT, stale);
+        if (!found || stale()) {
+          if (!this.exiting) this.scanAgain = true;
+          continue;
+        }
+        const ids = new Set(found.ids);
+        // Keys that changed while the scan was walking: it may have seen them before or
+        // after, so the event is the newer truth.
+        for (const [id, op] of this.scanEvents) {
+          if (op === "add") ids.add(id);
+          else ids.delete(id);
+        }
+        this.idSet = ids;
+        this.ids = [...ids];
+        const keep = new Map<string, string>();
+        for (const id of this.ids) keep.set(id, this.labelFor(id));
+        if (this.selected) keep.set(this.selected, this.labelFor(this.selected));
+        this.labels = keep;
+        this.sortIds();
+        this.truncated = found.truncated;
+        this.pendingAdd.clear();
+        this.pendingRemove.clear();
+        this.rowsDirty = true;
+        if (!this.selected) {
+          this.rebuildRows();
+          const row = this.rows[this.cursor];
+          if (row?.kind === "key") this.select(row.id, true);
+        }
+      } catch (err) {
+        if (this.scanLoud && !this.exiting) this.toastErr(err);
+      } finally {
+        this.scanEvents = null;
+      }
+    } while (this.scanAgain && !this.exiting);
+  }
+
+  private scheduleQuietRescan(delay: number): void {
     if (this.quietScanTimer) return;
     this.quietScanTimer = setTimeout(() => {
       this.quietScanTimer = null;
       void this.rescan(true);
-    }, 1000);
+    }, delay);
   }
 
   /** Folds key events into the sorted list in batches, once per frame rather than once per event. */
   private applyPending(): void {
     if (!this.pendingAdd.size && !this.pendingRemove.size) return;
     let removed = false;
-    for (const id of this.pendingRemove) if (this.idSet.delete(id)) removed = true;
+    for (const id of this.pendingRemove) {
+      if (this.idSet.delete(id)) removed = true;
+      // Keys come and go all day on a cache; their labels shouldn't pile up.
+      if (id !== this.selected) this.labels.delete(id);
+    }
     if (removed) this.ids = this.ids.filter((id) => this.idSet.has(id));
     let added = false;
     for (const id of this.pendingAdd) {
@@ -610,7 +780,8 @@ export class RedisApp {
     if (added) this.sortIds();
     this.pendingAdd.clear();
     this.pendingRemove.clear();
-    this.rowsDirty = true;
+    // An event on a key already listed changes nothing in the tree: don't rebuild it.
+    if (removed || added) this.rowsDirty = true;
   }
 
   /** Keys as a tree of their ":"-separated prefixes. A prefix holding a single key isn't worth a level. */
@@ -719,7 +890,12 @@ export class RedisApp {
   }
 
   private ensureMeta(ids: string[]): void {
-    const need = ids.filter((id) => !this.meta.has(id) && !this.metaPending.has(id));
+    const now = Date.now();
+    const need = ids.filter((id) => {
+      if (this.metaPending.has(id)) return false;
+      const m = this.meta.get(id);
+      return !m || (m.stale === true && now - m.at > 1000);
+    });
     if (!need.length || !this.connected) return;
     for (const id of need) this.metaPending.add(id);
     d.fetchMeta(this.conn, need, this.own)
@@ -894,7 +1070,7 @@ export class RedisApp {
       case "end": case "G": this.valueCursor = last; return;
       case "left": case "h": case "tab": case "escape": this.focus = "list"; return;
       case "enter": {
-        const text = this.valueDetails[this.valueCursor];
+        const text = this.valueDetail(this.valueCursor);
         if (text) this.detail = { title: this.labelFor(this.selected!), text, top: 0 };
         return;
       }
@@ -914,35 +1090,59 @@ export class RedisApp {
   private activityKey(k: Key): void {
     const items = this.actItems;
     const last = items.length - 1;
+    const at = this.selIndex(items);
+    const pick = (i: number) => {
+      const e = items[clamp(i, 0, Math.max(0, last))];
+      this.actSel = e ? e.seq : null;
+    };
     switch (k) {
-      case "up": case "k": this.actCursor = Math.max(0, (this.actCursor ?? items.length) - 1); return;
+      case "up": case "k":
+        if (items.length) pick((at ?? items.length) - 1);
+        return;
       case "down": case "j":
-        if (this.actCursor === null) return;
-        this.actCursor = this.actCursor + 1 >= last ? null : this.actCursor + 1;
+        if (at === null) return;
+        if (at + 1 >= last) this.actSel = null;
+        else pick(at + 1);
         return;
-      case "pageup": this.actCursor = Math.max(0, (this.actCursor ?? items.length) - this.actPage); return;
+      case "pageup":
+        if (items.length) pick((at ?? items.length) - this.actPage);
+        return;
       case "pagedown":
-        if (this.actCursor === null) return;
-        this.actCursor = this.actCursor + this.actPage >= last ? null : this.actCursor + this.actPage;
+        if (at === null) return;
+        if (at + this.actPage >= last) this.actSel = null;
+        else pick(at + this.actPage);
         return;
-      case "home": case "g": this.actCursor = 0; return;
-      case "end": case "G": this.actCursor = null; return;
+      case "home": case "g": pick(0); return;
+      case "end": case "G": this.actSel = null; return;
       case " ": this.paused = this.paused === null ? this.seq : null; return;
       case "/": return this.ask("Show only activity containing", this.activityFilter, (v) => {
         this.activityFilter = v.trim();
-        this.actCursor = null;
+        this.actSel = null;
       });
       case "escape": this.activityFilter = ""; return;
       case "x":
         this.activity = [];
-        this.actCursor = null;
+        this.actSel = null;
         return;
       case "enter": {
-        const e = this.actCursor !== null ? items[this.actCursor] : items[last];
+        const e = at !== null ? items[at] : items[last];
         if (e) this.jumpTo(e);
         return;
       }
     }
+  }
+
+  /** Where the selected entry is in `items`, or the next one still shown if it was trimmed or filtered out. */
+  private selIndex(items: Entry[]): number | null {
+    if (this.actSel === null || !items.length) return null;
+    let lo = 0;
+    let hi = items.length - 1;
+    while (lo < hi) {
+      const mid = (lo + hi) >> 1;
+      if (items[mid]!.seq < this.actSel) lo = mid + 1;
+      else hi = mid;
+    }
+    return lo;
   }
 
   private pubsubKey(k: Key): void {
@@ -1020,14 +1220,20 @@ export class RedisApp {
       return this.confirmThen(`Delete ${clip(row.label, 60)}?`, false, async () => {
         const n = await d.deleteKeys(this.conn, [row.id]);
         this.pendingRemove.add(row.id);
+        if (row.id === this.selected) this.reselect = true;
         this.toast(n ? `Deleted ${row.label}` : `${row.label} was already gone`, n ? "ok" : "info");
       });
     }
-    // Exactly the keys shown under this group, so an active filter narrows what's deleted.
-    const ids = this.ids.filter((id) => this.labelFor(id).startsWith(row.id));
+    // Exactly the keys shown under this group, so an active filter narrows what's
+    // deleted. A key named exactly like the prefix ("user:") is its own row, not in it.
+    const ids = this.ids.filter((id) => {
+      const label = this.labelFor(id);
+      return label.startsWith(row.id) && label !== row.id;
+    });
     this.confirmThen(`Delete all ${fmt(ids.length)} keys under ${clip(row.label, 40)}?`, true, async () => {
       const n = await d.deleteKeys(this.conn, ids);
       for (const id of ids) this.pendingRemove.add(id);
+      if (this.selected && ids.includes(this.selected)) this.reselect = true;
       this.toast(`Deleted ${fmt(n)} keys`, "ok");
     });
   }
@@ -1038,6 +1244,7 @@ export class RedisApp {
     this.confirmThen(`Delete ${what} (${fmt(this.ids.length)}${this.truncated ? "+" : ""} keys)?`, true, async () => {
       const n = await d.deleteMatching(this.conn, this.filter);
       this.toast(`Deleted ${fmt(n)} keys`, "ok");
+      this.selected = null;
       await this.rescan(true);
     });
   }
@@ -1098,7 +1305,7 @@ export class RedisApp {
 
   private copy(row: boolean): void {
     if (!this.value || this.valueFor !== this.selected) return;
-    const text = row ? this.valueDetails[this.valueCursor] ?? "" : wholeText(this.value);
+    const text = row ? this.valueDetail(this.valueCursor) : wholeText(this.value);
     if (!text) return this.toast("Nothing to copy", "info");
     this.toast(clipboard(text) ? `Copied ${row ? "this entry" : "the value"}` : "No clipboard tool found (pbcopy, wl-copy, xclip or xsel)", "info");
   }
@@ -1196,6 +1403,12 @@ export class RedisApp {
     }
     this.applyPending();
     if (this.rowsDirty) this.rebuildRows();
+    if (this.reselect) {
+      // After you delete the selected key, the value pane follows the cursor to the next one.
+      this.reselect = false;
+      const row = this.rows[this.cursor];
+      if (row?.kind === "key") this.select(row.id, true);
+    }
     const bodyH = H - 3;
     const body =
       this.view === "keys" ? this.keysView(W, bodyH)
@@ -1385,11 +1598,18 @@ export class RedisApp {
     const label = this.labelFor(this.selected);
     const note = this.metaNote(this.selected);
     if (!this.value || this.valueFor !== this.selected) return box(label, note, centered(["Loading…"], inner, bodyH), w, h, this.focus === "value");
-    const c = this.valueContent(inner);
+    const v = this.value;
+    const tick = v.kind === "hash" && v.rows.some((r) => r.ttlMs !== null) ? Math.floor(Date.now() / 1000) : 0;
+    let cached = this.valueCache;
+    if (!cached || cached.value !== v || cached.width !== inner || cached.tick !== tick) {
+      cached = { value: v, width: inner, tick, content: this.valueContent(inner) };
+      this.valueCache = cached;
+    }
+    const c = cached.content;
     const extra = this.valueExtra ? 1 : 0;
     const room = Math.max(1, bodyH - (c.head ? 1 : 0) - (c.foot ? 1 : 0) - extra);
     this.valueLen = c.lines.length;
-    this.valueDetails = c.details;
+    this.valueDetail = c.detail;
     this.valuePage = Math.max(1, room - 1);
     this.valueCursor = clamp(this.valueCursor, 0, Math.max(0, c.lines.length - 1));
     if (this.valueCursor < this.valueTop) this.valueTop = this.valueCursor;
@@ -1406,7 +1626,7 @@ export class RedisApp {
     return box(label, note, filled, w, h, this.focus === "value");
   }
 
-  private table(iw: number, headers: string[], rows: string[][], details: string[], align: ("left" | "right")[] = []): ValueContent {
+  private table(iw: number, headers: string[], rows: string[][], detail: (i: number) => string, align: ("left" | "right")[] = []): ValueContent {
     const n = headers.length;
     const widths = headers.map((h, c) => Math.max(width(h), ...rows.slice(0, 300).map((r) => width(oneLine(r[c] ?? "")))));
     const cap = Math.max(8, Math.floor(iw * 0.4));
@@ -1417,16 +1637,16 @@ export class RedisApp {
     }
     widths[n - 1] = Math.max(4, iw - used);
     const line = (r: string[]) => cell(r.map((v, c) => cell(oneLine(v), widths[c]!, align[c] ?? "left")).join("  "), iw);
-    return { head: pc.dim(line(headers)), lines: rows.map(line), details };
+    return { head: pc.dim(line(headers)), lines: rows.map(line), detail };
   }
 
   private valueContent(iw: number): ValueContent {
     const v = this.value!;
-    const p = d.printable;
+    const p = d.preview;
     const more = (shown: number, total: number) => (total > shown ? `showing ${fmt(shown)} of ${fmt(total)}` : undefined);
-    const text = (lines: string[], detail: string, foot?: string): ValueContent => ({
+    const text = (lines: string[], whole: string, foot?: string): ValueContent => ({
       lines: lines.map((l) => cell(oneLine(l), iw)),
-      details: lines.map(() => detail),
+      detail: () => whole,
       foot,
     });
     switch (v.kind) {
@@ -1449,19 +1669,19 @@ export class RedisApp {
           if (withTtl) cols.push(r.ttlMs === null ? "" : d.formatDuration(Math.max(0, r.ttlMs - (now - v.at))));
           return cols;
         });
-        const details = v.rows.map((r) => `${p(r.field)}\n\n${d.valueText(r.value)}`);
-        return { ...this.table(iw, ["field", "value", ...(withTtl ? ["ttl"] : [])], rows, details), foot: more(v.rows.length, v.total) };
+        const detail = (i: number) => (v.rows[i] ? `${d.printable(v.rows[i]!.field)}\n\n${d.valueText(v.rows[i]!.value)}` : "");
+        return { ...this.table(iw, ["field", "value", ...(withTtl ? ["ttl"] : [])], rows, detail), foot: more(v.rows.length, v.total) };
       }
       case "list":
         return {
-          ...this.table(iw, ["#", "value"], v.rows.map((r, i) => [String(i), p(r)]), v.rows.map((r) => d.valueText(r)), ["right"]),
+          ...this.table(iw, ["#", "value"], v.rows.map((r, i) => [String(i), p(r)]), (i) => (v.rows[i] ? d.valueText(v.rows[i]!) : ""), ["right"]),
           foot: more(v.rows.length, v.total),
         };
       case "set":
-        return { ...this.table(iw, ["member"], v.rows.map((r) => [p(r)]), v.rows.map((r) => d.valueText(r))), foot: more(v.rows.length, v.total) };
+        return { ...this.table(iw, ["member"], v.rows.map((r) => [p(r)]), (i) => (v.rows[i] ? d.valueText(v.rows[i]!) : "")), foot: more(v.rows.length, v.total) };
       case "zset":
         return {
-          ...this.table(iw, ["score", "member"], v.rows.map((r) => [r.score, p(r.member)]), v.rows.map((r) => `${p(r.member)}\nscore ${r.score}`), ["right"]),
+          ...this.table(iw, ["score", "member"], v.rows.map((r) => [r.score, p(r.member)]), (i) => (v.rows[i] ? `${d.printable(v.rows[i]!.member)}\nscore ${v.rows[i]!.score}` : ""), ["right"]),
           foot: more(v.rows.length, v.total) ?? "lowest score first",
         };
       case "stream":
@@ -1469,16 +1689,19 @@ export class RedisApp {
           ...this.table(
             iw,
             ["id", "fields"],
-            v.rows.map((r) => [r.id, r.fields.map(([f, x]) => `${p(f)}=${p(x)}`).join("  ")]),
-            v.rows.map((r) => `${r.id}\n\n${r.fields.map(([f, x]) => `${p(f)}: ${d.valueText(x)}`).join("\n")}`),
+            v.rows.map((r) => [r.id, r.fields.map(([f, x]) => `${p(f, 200)}=${p(x, 200)}`).join("  ")]),
+            (i) => {
+              const r = v.rows[i];
+              return r ? `${r.id}\n\n${r.fields.map(([f, x]) => `${d.printable(f)}: ${d.valueText(x)}`).join("\n")}` : "";
+            },
           ),
           foot: `${more(v.rows.length, v.total) ?? "newest first"}${v.groups ? ` · ${v.groups} consumer group${v.groups === 1 ? "" : "s"}` : ""}`,
         };
       case "timeseries":
-        return this.table(iw, ["time", "value"], v.rows.map((r) => [new Date(r.at).toISOString(), r.value]), v.rows.map((r) => `${new Date(r.at).toISOString()}\n${r.value}`));
+        return this.table(iw, ["time", "value"], v.rows.map((r) => [new Date(r.at).toISOString(), r.value]), (i) => (v.rows[i] ? `${new Date(v.rows[i]!.at).toISOString()}\n${v.rows[i]!.value}` : ""));
       case "vectorset":
         return {
-          ...this.table(iw, ["element (random sample)"], v.rows.map((r) => [p(r)]), v.rows.map((r) => p(r))),
+          ...this.table(iw, ["element (random sample)"], v.rows.map((r) => [p(r)]), (i) => (v.rows[i] ? d.printable(v.rows[i]!) : "")),
           foot: `${fmt(v.total)} vectors${v.dim ? ` · ${v.dim} dimensions` : ""}`,
         };
     }
@@ -1517,22 +1740,22 @@ export class RedisApp {
     const items = this.visibleActivity();
     this.actItems = items;
     this.actPage = Math.max(1, bodyH - 1);
+    const busy = this.monitorBusyUntil > Date.now();
     let body: string[];
     if (!this.monitorLive && !this.eventsLive) {
       body = centered(
-        this.opts.target.local && this.opts.monitor
-          ? ["The activity feed isn't available: this server refused MONITOR."]
-          : ["Activity uses MONITOR, which is off for servers on other machines.", "Pass --monitor to turn it on (it can slow a busy server)."],
+        busy ? ["Paused: Redis was queueing commands faster than shellup could read them.", "The feed comes back by itself shortly."]
+        : this.opts.target.local && this.opts.monitor ? ["The activity feed isn't available: this server refused MONITOR."]
+        : ["Activity uses MONITOR, which is off for servers on other machines.", "Pass --monitor to turn it on (it can slow a busy server)."],
         inner, bodyH,
       );
     } else if (!items.length) {
       body = centered([this.activityFilter ? `Nothing matches "${this.activityFilter}".` : "Waiting for commands: run your app and they show up here."], inner, bodyH);
     } else {
       let top: number;
-      let cursor: number | null = null;
-      if (full && this.actCursor !== null) {
-        cursor = clamp(this.actCursor, 0, items.length - 1);
-        this.actCursor = cursor;
+      const cursor = full ? this.selIndex(items) : null;
+      if (cursor !== null) {
+        this.actSel = items[cursor]!.seq;
         if (cursor < this.actTop) this.actTop = cursor;
         if (cursor >= this.actTop + bodyH) this.actTop = cursor - bodyH + 1;
         top = clamp(this.actTop, 0, Math.max(0, items.length - bodyH));
@@ -1544,7 +1767,8 @@ export class RedisApp {
       });
     }
     const newer = this.paused === null ? 0 : this.activity.filter((e) => e.seq > this.paused!).length;
-    const note = !this.monitorLive ? (this.eventsLive ? "key events only" : "off")
+    const note = busy ? "paused: server too busy"
+      : !this.monitorLive ? (this.eventsLive ? "key events only" : "off")
       : this.paused !== null ? `paused · ${fmt(newer)} new`
       : `${fmt(this.rate())}/s`;
     const title = full ? (this.activityFilter ? `Activity · "${this.activityFilter}"` : "Activity") : "Activity (live)";
@@ -1613,9 +1837,8 @@ export class RedisApp {
       lines.push(...this.simpleTable(["Slow log", "at", "command"], slow, W, ["right", "left", "left"]));
     }
     lines.push(blank(W));
-    const own = new Set([...this.ownPorts].map(String));
     const clients = this.clients.map((x) => {
-      const mine = own.has((x.addr ?? "").slice((x.addr ?? "").lastIndexOf(":") + 1));
+      const mine = this.isOwn(x.addr ?? "");
       return [(x.name || "–") + (mine ? " (shellup)" : ""), x.addr ?? "", x.db ?? "", x.cmd ?? "", d.formatDuration(Number(x.age ?? 0) * 1000), d.formatDuration(Number(x.idle ?? 0) * 1000)];
     });
     lines.push(...this.simpleTable(["Clients", "address", "db", "last command", "age", "idle"], clients, W, ["left", "left", "right", "left", "right", "right"]));
@@ -1654,8 +1877,10 @@ export class RedisApp {
     const body = items.length
       ? items.slice(-bodyH).map((m) => {
           const head = `${clock(m.at)} `;
-          const channel = cell(oneLine(m.channel), 18);
-          const text = cell(oneLine(m.text), Math.max(0, inner - width(head) - 19));
+          // The channel column gives way first on a narrow terminal, so the row still fits.
+          const chW = clamp(inner - width(head) - 12, 4, 18);
+          const channel = cell(oneLine(m.channel), chW);
+          const text = cell(oneLine(m.text), Math.max(0, inner - width(head) - chW - 1));
           return `${pc.dim(head)}${pc.magenta(channel)} ${text}`;
         })
       : centered(["Messages published on any channel appear here.", "Press p to publish one."], inner, bodyH);
@@ -1699,7 +1924,12 @@ export class RedisApp {
     const inner = pw - 2;
     const bodyH = ph - 2;
     this.detailPage = Math.max(1, bodyH - 1);
-    const lines = wrap(det.text, inner);
+    let cached = this.detailCache;
+    if (!cached || cached.text !== det.text || cached.width !== inner) {
+      cached = { text: det.text, width: inner, lines: wrap(det.text, inner) };
+      this.detailCache = cached;
+    }
+    const lines = cached.lines;
     det.top = clamp(det.top, 0, Math.max(0, lines.length - bodyH));
     const body = lines.slice(det.top, det.top + bodyH).map((l) => cell(l, inner));
     const where = lines.length > bodyH ? `${det.top + 1}-${Math.min(lines.length, det.top + bodyH)} of ${fmt(lines.length)} lines` : `${fmt(lines.length)} lines`;

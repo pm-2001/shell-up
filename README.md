@@ -107,11 +107,18 @@ actually caches while it runs:
 Delete a key, a whole prefix, or everything matching a filter (always confirmed); set a
 TTL; rename; edit a short string; copy a value; switch database. `?` lists every key.
 
-It stays out of your way: listing uses `SCAN`, never `KEYS`; shellup's own commands are
-hidden from the activity feed; and the one setting it changes to see key changes live
-(`notify-keyspace-events`) goes back to how it was when you quit. The activity feed uses
-`MONITOR`, which can slow a busy server, so it's on by default only for a Redis on your
-own machine. `--read-only` changes nothing at all.
+It stays out of your way:
+
+- Listing uses `SCAN`, never `KEYS`, and shellup's own commands never appear in the
+  activity feed or in the hit rate, which counts only your apps' lookups.
+- To see key changes live it turns on `notify-keyspace-events`, and puts it back when
+  you quit. If your app changes that setting while shellup is open, your app's value
+  is the one that stays.
+- The activity feed uses `MONITOR`, which can slow a busy server, so it's on by default
+  only for a Redis on your own machine. If Redis ever queues commands faster than
+  shellup can read them, the feed pauses itself for 30 seconds rather than let that
+  backlog take memory your keys need.
+- `--read-only` changes nothing at all.
 
 ## What it touches
 

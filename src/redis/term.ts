@@ -68,12 +68,15 @@ export type Seg = [text: string, style?: (s: string) => string];
 
 /** A line exactly `w` wide from styled pieces: `left` packed from the start, `right` pinned to the end. */
 export function bar(left: Seg[], right: Seg[], w: number): string {
-  const rightW = right.reduce((n, [t]) => n + stringWidth(t), 0);
+  // Everything shown goes through oneLine: a tab or newline in a key name would
+  // otherwise shift or scroll the screen, and the diff renderer can't repair that.
+  const rightW = right.reduce((n, [t]) => n + stringWidth(oneLine(t)), 0);
   const showRight = rightW <= w;
   const room = showRight ? w - rightW : w;
   let out = "";
   let used = 0;
-  for (const [text, style] of left) {
+  for (const [raw, style] of left) {
+    const text = oneLine(raw);
     const tw = stringWidth(text);
     if (used + tw > room) {
       const c = clip(text, room - used);
@@ -86,7 +89,7 @@ export function bar(left: Seg[], right: Seg[], w: number): string {
     out += style ? style(text) : text;
     used += tw;
   }
-  const rightOut = showRight ? right.map(([t, s]) => (s ? s(t) : t)).join("") : "";
+  const rightOut = showRight ? right.map(([t, s]) => (s ? s(oneLine(t)) : oneLine(t))).join("") : "";
   return out + " ".repeat(Math.max(0, w - used - (showRight ? rightW : 0))) + rightOut;
 }
 
@@ -94,8 +97,8 @@ export function bar(left: Seg[], right: Seg[], w: number): string {
 export function box(title: string, note: string, body: string[], w: number, h: number, focused: boolean): string[] {
   const edge = focused ? pc.cyan : pc.dim;
   const inner = Math.max(0, w - 2);
-  const t = clip(title, Math.max(0, inner - 4));
-  const n = note ? clip(note, Math.max(0, inner - 8 - stringWidth(t))) : "";
+  const t = clip(oneLine(title), Math.max(0, inner - 4));
+  const n = note ? clip(oneLine(note), Math.max(0, inner - 8 - stringWidth(t))) : "";
   const noteW = n ? stringWidth(n) + 3 : 0;
   const fill = Math.max(0, inner - 3 - stringWidth(t) - noteW);
   const top = t

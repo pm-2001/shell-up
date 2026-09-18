@@ -32,6 +32,23 @@ export function printable(b: Buffer): string {
   return out;
 }
 
+/**
+ * The start of a value, for one line in a table. Escaping a whole 8 KB value just
+ * to show 80 columns of it is what made big lists slow. The cut backs off to a
+ * character boundary, so UTF-8 text isn't mistaken for binary.
+ */
+export function preview(b: Buffer, max = 1024): string {
+  if (b.length <= max) return printable(b);
+  let end = max;
+  let back = 0;
+  while (end > 0 && back < 3 && (b[end - 1]! & 0xc0) === 0x80) {
+    end--;
+    back++;
+  }
+  if (end > 0 && b[end - 1]! >= 0xc0) end--;
+  return printable(b.subarray(0, end)) + "…";
+}
+
 export function str(r: Reply | undefined): string {
   if (r === null || r === undefined) return "";
   if (Buffer.isBuffer(r)) return r.toString("utf8");
@@ -78,7 +95,21 @@ const escapeRe = (c: string) => c.replace(/[.*+?^${}()|[\]\\/]/g, "\\$&");
 export const escapeGlob = (s: string) => s.replace(/[*?[\]\\]/g, "\\$&");
 
 /** Redis glob (* ? [abc] [^a] \x) as a RegExp over key ids, so live events can be tested against the filter. */
+/**
+ * A Redis glob (* ? [a-z] [^a] \x) as a RegExp over key ids, so live events can be
+ * tested against the filter. Never throws: a pattern JavaScript can't express
+ * matches everything here, and SCAN still applies the real glob.
+ */
 export function globToRegExp(glob: string): RegExp {
+  try {
+    return new RegExp(`^${globBody(glob)}$`);
+  } catch {
+    return /^[\s\S]*$/;
+  }
+}
+
+function globBody(glob: string): string {
+  // Redis matches bytes, so the glob is compared as bytes too (latin1, like key ids).
   const g = Buffer.from(glob, "utf8").toString("latin1");
   let re = "";
   for (let i = 0; i < g.length; i++) {
@@ -92,14 +123,33 @@ export function globToRegExp(glob: string): RegExp {
         re += "\\[";
         continue;
       }
-      let body = g.slice(i + 1, close);
-      const negate = body.startsWith("^");
-      if (negate) body = body.slice(1);
-      re += `[${negate ? "^" : ""}${body.replace(/[\\\]]/g, "\\$&")}]`;
+      re += charClass(g.slice(i + 1, close));
       i = close;
     } else re += escapeRe(c);
   }
-  return new RegExp(`^${re}$`);
+  return re;
+}
+
+/** A glob [..] as a regex class. Redis swaps reversed ranges such as z-a, so this does too. */
+function charClass(body: string): string {
+  const hex = (ch: string) => "\\x" + ch.charCodeAt(0).toString(16).padStart(2, "0");
+  let i = 0;
+  const negate = body[0] === "^";
+  if (negate) i = 1;
+  let out = "";
+  for (; i < body.length; i++) {
+    let a = body[i]!;
+    if (a === "\\" && i + 1 < body.length) a = body[++i]!;
+    if (body[i + 1] === "-" && i + 2 < body.length) {
+      i += 2;
+      let b = body[i]!;
+      if (b === "\\" && i + 1 < body.length) b = body[++i]!;
+      const [lo, hi] = a <= b ? [a, b] : [b, a];
+      out += `${hex(lo)}-${hex(hi)}`;
+    } else out += hex(a);
+  }
+  if (!out) return negate ? "[\\s\\S]" : "[^\\s\\S]";
+  return `[${negate ? "^" : ""}${out}]`;
 }
 
 // ── Keys ───────────────────────────────────────────────────────────────────
@@ -121,11 +171,20 @@ export function tally(t: Tally | undefined, exists: boolean, reads: number): voi
 }
 
 
-/** SCAN, never KEYS: it walks the keyspace in steps instead of blocking Redis while it lists everything. */
-export async function scanKeys(conn: RedisConn, match: string, limit: number): Promise<{ ids: string[]; truncated: boolean }> {
+/**
+ * SCAN, never KEYS: it walks the keyspace in steps instead of blocking Redis while
+ * it lists everything. `stop` is checked between steps; a stopped scan returns null.
+ */
+export async function scanKeys(
+  conn: RedisConn,
+  match: string,
+  limit: number,
+  stop?: () => boolean,
+): Promise<{ ids: string[]; truncated: boolean } | null> {
   const found = new Set<string>();
   let cursor = "0";
   do {
+    if (stop?.()) return null;
     const reply = asList(await conn.call("SCAN", cursor, "MATCH", Buffer.from(match, "utf8"), "COUNT", 1000));
     cursor = str(reply[0]);
     for (const key of asList(reply[1])) {
@@ -143,6 +202,8 @@ export interface KeyMeta {
   at: number;
   bytes: number | null;
   size: number | null;
+  /** Changed since fetched; refetched at most once a second, so a busy key doesn't mean four extra commands per write. */
+  stale?: boolean;
 }
 
 const SIZE: Record<string, string> = {
@@ -341,8 +402,8 @@ export async function deleteKeys(conn: RedisConn, ids: string[]): Promise<number
 }
 
 export async function deleteMatching(conn: RedisConn, match: string): Promise<number> {
-  const { ids } = await scanKeys(conn, match, Number.POSITIVE_INFINITY);
-  return deleteKeys(conn, ids);
+  const found = await scanKeys(conn, match, Number.POSITIVE_INFINITY);
+  return found ? deleteKeys(conn, found.ids) : 0;
 }
 
 /** null removes the expiry. Returns false when there was nothing to change. */
@@ -458,6 +519,24 @@ export function parseClients(text: string): Record<string, string>[] {
     });
 }
 
+/**
+ * The id and address Redis sees this connection on. The address is how shellup
+ * recognises its own commands in MONITOR, including through port forwarding, NAT
+ * or a proxy, where the local port says nothing about what the server sees.
+ */
+export async function whoAmI(conn: RedisConn): Promise<{ id: number | null; addr: string | null }> {
+  let text = str(await conn.call("CLIENT", "INFO").catch(() => null));
+  if (!text) {
+    // CLIENT INFO arrived in Redis 6.2.
+    const id = await conn.call("CLIENT", "ID").catch(() => null);
+    if (typeof id === "number") {
+      text = str(await conn.call("CLIENT", "LIST").catch(() => null)).split("\n").find((l) => l.startsWith(`id=${id} `)) ?? "";
+    }
+  }
+  const f = parseClients(text)[0] ?? {};
+  return { id: f.id ? Number(f.id) : null, addr: f.addr ?? null };
+}
+
 // ── MONITOR ────────────────────────────────────────────────────────────────
 
 export interface MonitorLine {
@@ -469,7 +548,8 @@ export interface MonitorLine {
 
 /** `1726640000.123456 [0 127.0.0.1:52411] "SET" "k" "v"` → its parts. */
 export function parseMonitorLine(line: string): MonitorLine | null {
-  const m = /^(\d+\.\d+) \[(\d+) ([^\]]*)\] ([\s\S]*)$/.exec(line);
+  // The source has no spaces but can hold brackets: an IPv6 client is [::1]:62443.
+  const m = /^(\d+\.\d+) \[(\d+) (\S+)\] ([\s\S]*)$/.exec(line);
   if (!m) return null;
   return { at: Math.round(Number(m[1]) * 1000), db: Number(m[2]), source: m[3]!, args: splitQuoted(m[4]!) };
 }

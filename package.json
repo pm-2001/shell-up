@@ -1,6 +1,6 @@
 {
   "name": "@pm-2001/shellup",
-  "version": "0.3.1",
+  "version": "0.4.0",
   "description": "Level up your terminal in 60 seconds — a beautiful prompt, modern tool swaps, and sane defaults, installed by one command and reversible by another.",
   "keywords": [
     "terminal",
